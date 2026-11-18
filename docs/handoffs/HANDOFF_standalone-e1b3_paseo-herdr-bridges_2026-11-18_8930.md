@@ -1,8 +1,8 @@
 ---
 schema_version: 1
 handoff_id: 8930
-parent_handoff_ids: []
-lineage: none
+parent_handoff_ids: [74e4]
+lineage: inferred
 chain: [standalone-e1b3]
 repo: herdr4paseo
 workspace: main
@@ -37,7 +37,7 @@ Everything is done and pushed/PR'd; nothing is left editable in-session. Two PRs
 - [decision] Targeted `--workspace=@getpaseo/cli` install for PR validation; rejected: full monorepo `npm install`; because the full tree fails on `sharp`/node and the CLI tree is all the tests need.
 
 ## Relations
-- continues [[HANDOFF_standalone-513f_feature-picks_2026-10-30_513f]]
+- continues [[HANDOFF_standalone-aff7_herdr-screen-live_2026-11-17_74e4]]
 
 ## Evidence & Data
 - B1a upstream PR (ready): https://github.com/getpaseo/paseo/pull/10122 — branch `feat/paseo-cli-logs-json`, head `4b5827703`; 38 tests pass + typecheck + lint + format (all via bg), CI `action_required` (first-time-fork maintainer approval).
