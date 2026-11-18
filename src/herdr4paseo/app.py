@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import os
 from collections.abc import Callable
 
@@ -38,6 +39,9 @@ from .core import (
     history_path,
     load_history,
     logs_argv,
+    timeline_argv,
+    parse_timeline,
+    render_timeline_item,
     ls_argv,
     match_commands,
     parse_agents,
@@ -245,6 +249,8 @@ QUIT_COMMANDS = frozenset({"/quit", "/exit"})
 class Herdr4PaseoApp(App[None]):
     CSS = """
     #log { height: 1fr; scrollbar-size-vertical: 1; scrollbar-color: #363646; scrollbar-color-hover: #54546D; scrollbar-color-active: #54546D; scrollbar-background: ansi_default; scrollbar-background-hover: ansi_default; scrollbar-background-active: ansi_default; }
+    #chat { height: 1fr; }
+    #chat.hidden, #log.hidden { display: none; }
     #prompt { height: 6; border: round $primary; }
     #permits { height: auto; color: $warning; text-style: bold; padding: 0 1; border-left: thick $warning; }
     #permits.hidden { display: none; }
@@ -259,6 +265,7 @@ class Herdr4PaseoApp(App[None]):
     ENABLE_COMMAND_PALETTE = False  # Ctrl+P is prompt history here
     BINDINGS = [
         Binding("ctrl+t", "toggle_behavior", "steer/interrupt"),
+        Binding("ctrl+v", "toggle_view", "log/chat", priority=True),
         Binding("ctrl+o", "toggle_tools", "tools only"),
         # Ctrl+G is macOS's Gemini shortcut, so the agent picker lives on Ctrl+L.
         Binding("ctrl+l", "switch_agent", "agents"),
@@ -280,6 +287,8 @@ class Herdr4PaseoApp(App[None]):
         self._tail = tail
         self.behavior = behavior
         self.tools_only = False
+        self.chat_view = False
+        self.timeline: list[dict] = []
         self.agent: Agent | None = None
         self._history: list[str] = load_history(history_path())
         self._last_status: str | None = None
@@ -293,6 +302,7 @@ class Herdr4PaseoApp(App[None]):
         yield Header()
         with Vertical():
             yield RichLog(id="log", wrap=True, markup=False, highlight=False, auto_scroll=True)
+            yield RichLog(id="chat", classes="hidden", wrap=True, markup=False, highlight=False)
             yield Static("", id="permits", classes="hidden", markup=False)
             yield Static("", id="slash", classes="hidden", markup=False)
             yield PromptArea(id="prompt")
@@ -393,7 +403,7 @@ class Herdr4PaseoApp(App[None]):
 
     def _update_subtitle(self, status: str) -> None:
         view = "tools only" if self.tools_only else "full log"
-        self.sub_title = f"{status} | send: {self.behavior} | {view}"
+        self.sub_title = f"{status} | send: {self.behavior} | {'chat' if self.chat_view else 'log'} | {view}"
 
     # -- log stream -----------------------------------------------------------------
 
@@ -408,6 +418,10 @@ class Herdr4PaseoApp(App[None]):
             return
         log = self.query_one("#log", RichLog)
         agent_id, tools_only = self.agent.id, self.tools_only
+        if self.chat_view:
+            self._start_chat_stream()
+            return
+        self.workers.cancel_group(self, "chat-stream")
         while True:
             log.clear()
             styler = LogStyler()  # fresh state for each (re)attach: the tail is replayed from scratch
@@ -428,6 +442,61 @@ class Herdr4PaseoApp(App[None]):
                         proc.terminate()
                     await proc.wait()
             self._note(f"log stream ended (rc={rc}); reconnecting in {RECONNECT_SECONDS:g}s", "meta")
+            await asyncio.sleep(RECONNECT_SECONDS)
+
+    def _apply_timeline(self, raw: str) -> None:
+        for item in parse_timeline(raw):
+            identity = item.get("messageId") or item.get("callId")
+            index = next((i for i, old in enumerate(self.timeline) if identity and old["type"] == item["type"] and (old.get("messageId") or old.get("callId")) == identity), None)
+            # Older providers omit messageId: contiguous growing assistant text is a snapshot.
+            if index is None and not identity and item["type"] == "assistant_message" and self.timeline:
+                old = self.timeline[-1]
+                if old["type"] == item["type"] and item.get("text", "").startswith(old.get("text", "")):
+                    index = len(self.timeline) - 1
+            if index is None:
+                self.timeline.append(item)
+            else:
+                self.timeline[index] = item
+        log = self.query_one("#chat", RichLog)
+        log.clear()
+        for item in self.timeline:
+            if not self.tools_only or item["type"] == "tool_call":
+                log.write(render_timeline_item(item))
+                log.write("")
+
+    @work(exclusive=True, group="chat-stream")
+    async def _start_chat_stream(self) -> None:
+        if self.agent is None:
+            return
+        agent_id = self.agent.id
+        while True:
+            self.timeline = []
+            self.query_one("#chat", RichLog).clear()
+            proc = await asyncio.create_subprocess_exec(
+                *timeline_argv(agent_id, tail=self._tail),
+                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            async def notices() -> None:
+                assert proc.stderr is not None
+                while line := await proc.stderr.readline():
+                    self._note(line.decode(errors="replace").rstrip(), "meta")
+            reader = asyncio.create_task(notices())
+            try:
+                assert proc.stdout is not None
+                while line := await proc.stdout.readline():
+                    try:
+                        self._apply_timeline(line.decode(errors="replace"))
+                    except (ValueError, json.JSONDecodeError):
+                        self._note("invalid timeline JSON record", "error.text")
+                await proc.wait()
+            finally:
+                if proc.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.terminate()
+                    await proc.wait()
+                await reader
+            self._note("chat stream ended; reconnecting", "meta")
             await asyncio.sleep(RECONNECT_SECONDS)
 
     # -- slash commands -------------------------------------------------------------
@@ -505,6 +574,13 @@ class Herdr4PaseoApp(App[None]):
     def action_toggle_behavior(self) -> None:
         self.behavior = BEHAVIORS[(BEHAVIORS.index(self.behavior) + 1) % len(BEHAVIORS)]
         self._update_subtitle(self.sub_title.split(" | ")[0])
+
+    def action_toggle_view(self) -> None:
+        self.chat_view = not self.chat_view
+        self.query_one("#log").set_class(self.chat_view, "hidden")
+        self.query_one("#chat").set_class(not self.chat_view, "hidden")
+        self._update_subtitle(self.sub_title.split(" | ")[0])
+        self._start_stream()
 
     def action_toggle_tools(self) -> None:
         self.tools_only = not self.tools_only

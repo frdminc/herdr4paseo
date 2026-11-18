@@ -110,3 +110,19 @@ The terminal bell rings, and a yellow `alert:` line is logged, when the shown ag
 ## Starting a new agent
 
 Ctrl+R opens a small form: a prompt (required), a directory (starts as the directory herdr4paseo runs in) and a provider, prefilled with the current agent's (`paseo run` refuses to start without one; `provider/model` also works, and `paseo provider ls` lists them). Enter runs `paseo run --no-wait --quiet --provider P <prompt>` in that directory, then attaches to the new agent by the id Paseo prints. A bare `paseo run` creates a local workspace for the directory; worktrees, models and output schemas are not offered here, use the `paseo` CLI for those.
+
+
+## Chat and log views
+
+Ctrl+V toggles the default line log and the opt-in structured chat. The header
+shows the active view. Ctrl+O filters either view to tools; prompt sending,
+permissions and slash commands keep their existing bindings.
+
+Chat follows `paseo logs <id> --json --tail N -f` as NDJSON, through `PASEO_BIN`.
+The parser also accepts the one-shot `paseo logs <id> --json --tail N` envelope.
+Assistant messages share the log's markdown styling and semantic THEME tokens.
+Message IDs and tool call IDs replace earlier snapshots; contiguous growing
+assistant messages without IDs replace the last assistant snapshot. The chat
+buffer redraws after updates, so partial fragments do not become separate rows.
+Switching views restarts the selected CLI stream and replays its tail. Stderr
+notices remain in the line log. No additional WebSocket request is used.

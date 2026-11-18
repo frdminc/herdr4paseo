@@ -20,6 +20,20 @@ cmd = sys.argv[1]
 if cmd == "ls":
     print(json.dumps(AGENTS))
 elif cmd == "logs":
+    if "--json" in sys.argv:
+        items = [
+            {"type": "user_message", "text": "hello chat"},
+            {"type": "assistant_message", "text": "Hello", "messageId": "m1"},
+            {"type": "assistant_message", "text": "Hello **world**", "messageId": "m1"},
+            {"type": "tool_call", "callId": "c1", "name": "Shell", "status": "completed", "detail": {"output": "done"}},
+        ]
+        if "-f" in sys.argv:
+            for item in items:
+                print(json.dumps(item), flush=True)
+            time.sleep(30)
+        else:
+            print(json.dumps({"agentId": sys.argv[2], "items": items}, indent=2))
+        sys.exit(0)
     tools_only = "--filter" in sys.argv
     print("[Shell] ls" if tools_only else "[User] hello there")
     if not tools_only:

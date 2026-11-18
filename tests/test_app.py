@@ -532,3 +532,41 @@ async def test_app_theme_keeps_the_terminal_background(calls):
         assert theme.name == "herdr4paseo" and theme.ansi  # ANSI theme: backgrounds are not repainted
         assert theme.background == theme.surface == theme.panel == "ansi_default"
         assert theme.warning == app_module.KANAGAWA["yellow"] and theme.error == app_module.KANAGAWA["red"]
+
+
+async def test_chat_follow_toggle_and_updates(calls):
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+v")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if len(app.timeline) == 3:
+                break
+        assert len(app.timeline) == 3
+        assert app.timeline[1]["text"] == "Hello **world**"
+        assert "chat" in app.sub_title
+        chat = app.query_one("#chat", RichLog)
+        text = "\n".join(line.text for line in chat.lines)
+        assert "You" in text and "world" in text and "Shell" in text
+        await pilot.press("ctrl+o")
+        await pilot.pause(0.3)
+        assert "tools only" in app.sub_title
+        assert "You" not in "\n".join(line.text for line in chat.lines)
+        await pilot.press("ctrl+v")
+        await settle(pilot, app, "[Shell] ls")
+        assert not app.chat_view
+    assert any("--json" in c and "-f" in c for c in recorded(calls) if c[0] == "logs")
+
+
+async def test_chat_one_shot_envelope(calls):
+    from herdr4paseo.app import run_paseo
+    from herdr4paseo.core import timeline_argv
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        code, out, _ = await run_paseo(timeline_argv("aaaaaaa", tail=5, follow=False))
+        assert code == 0
+        app._apply_timeline(out)
+        assert len(app.timeline) == 3
+        assert app.timeline[1]["text"] == "Hello **world**"

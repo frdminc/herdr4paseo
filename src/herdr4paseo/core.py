@@ -556,3 +556,43 @@ def agent_label_text(agent: Agent) -> Text:
     if style:
         text.stylize(style, start, start + len(agent.status))
     return text
+
+
+def timeline_argv(agent: str, *, tail: int, follow: bool = True) -> list[str]:
+    """Structured timeline through the same CLI boundary as the text log."""
+    return [paseo_bin(), "logs", agent, "--json", "--tail", str(tail)] + (["-f"] if follow else [])
+
+
+def parse_timeline(raw: str) -> list[dict]:
+    """Accept one-shot envelopes and individual follow NDJSON records."""
+    value = json.loads(raw)
+    items = value.get("items", [value]) if isinstance(value, dict) else []
+    if not isinstance(items, list) or any(not isinstance(i, dict) or not isinstance(i.get("type"), str) for i in items):
+        raise ValueError("invalid timeline items")
+    return items
+
+
+def render_timeline_item(item: dict) -> Text:
+    """Role labels survive NO_COLOR; assistant markdown shares the log styler."""
+    kind = item["type"]
+    if kind == "assistant_message":
+        result = Text("Assistant\n", style=style_for("md.heading"))
+        styler = LogStyler()
+        for line in item.get("text", "").splitlines():
+            result.append_text(styler.style(line))
+            result.append("\n")
+        return result
+    if kind in {"user_message", "reasoning"}:
+        label, token = ("You", "user.text") if kind == "user_message" else ("Reasoning", "thought")
+        return Text(f"{label}\n{item.get('text', '')}", style=style_for(token))
+    if kind == "tool_call":
+        status = item.get("status", "running")
+        result = Text(f"{item.get('name', 'Tool')} · {status}", style=style_for("tool.failed" if status == "failed" else "tool.tag"))
+        if item.get("detail"):
+            result.append("\n" + json.dumps(item["detail"], ensure_ascii=False, indent=2), style=style_for("tool.detail"))
+        return result
+    if kind == "todo":
+        return Text("Tasks\n" + "\n".join(f"[{'x' if t.get('completed') else ' '}] {t.get('text', t.get('description', ''))}" for t in item.get("items", [])), style=style_for("tool.detail"))
+    if kind in {"error", "notification"}:
+        return Text(f"[{item.get('level', kind)}] {item.get('message', '')}", style=style_for("error.text" if kind == "error" or item.get("level") == "error" else "permission"))
+    return Text(f"[{kind}] " + json.dumps({k: v for k, v in item.items() if k != "type"}, ensure_ascii=False), style=style_for("meta"))
