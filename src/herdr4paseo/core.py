@@ -256,7 +256,7 @@ class Command:
 _COMMAND_NAME = re.compile(r"[A-Za-z0-9_.:/-]+", re.ASCII)
 
 
-PERMIT_BATCH = 4  # requests one allow-dialog shows in full (and answers)
+PERMIT_BATCH = 1  # one allow-dialog shows (and answers) a single request, so it always fits the screen
 PERMIT_LABEL_MAX = 200
 
 
