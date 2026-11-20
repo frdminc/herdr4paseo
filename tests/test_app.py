@@ -753,8 +753,16 @@ async def test_permit_banner_title_and_dialogs_are_inert(calls, monkeypatch):
         await pilot.press("n")
 
 
-async def test_chat_skips_a_record_nested_past_the_recursion_limit(calls, monkeypatch):
+@pytest.mark.parametrize("depth, note_required", [(300, True), (100_000, False)])
+async def test_chat_skips_a_deeply_nested_record(calls, monkeypatch, depth, note_required):
+    # 300 parses everywhere, so only the explicit depth cap rejects it (the notice is required).
+    # 100000 may raise RecursionError or parse fine depending on the platform's C recursion limit;
+    # either way the record is skipped, the app lives and the next record arrives.
     monkeypatch.setenv("FAKE_PASEO_JSON_MODE", "deep")
+    monkeypatch.setenv("FAKE_PASEO_DEPTH", str(depth))
+    notes = []
+    real_note = Herdr4PaseoApp._note
+    monkeypatch.setattr(Herdr4PaseoApp, "_note", lambda self, message, token: (notes.append(message), real_note(self, message, token))[1])
     app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
     async with app.run_test() as pilot:
         await settle(pilot, app, "plain assistant line")
@@ -764,7 +772,10 @@ async def test_chat_skips_a_record_nested_past_the_recursion_limit(calls, monkey
             if any(i.get("text") == "after the deep record" for i in app.timeline):
                 break
         assert any(i.get("text") == "after the deep record" for i in app.timeline)
-        assert "invalid timeline JSON record" in log_text(app) and app.is_running
+        assert [i for i in app.timeline if i["type"] != "assistant_message"] == []  # the deep record added nothing
+        if note_required:
+            assert "invalid timeline JSON record" in notes  # asserted on _note calls, not on the hidden RichLog
+        assert app.is_running
 
 
 async def test_chat_redraw_is_budgeted_and_a_render_failure_does_not_exit(calls, monkeypatch):

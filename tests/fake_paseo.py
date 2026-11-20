@@ -44,7 +44,8 @@ elif cmd == "logs":
             sys.stderr.write("e" * 200_000 + "\n")
             sys.stderr.flush()
         if mode == "deep":  # a record nested far past Python's recursion limit, then a normal one
-            deep = "[" * 100_000 + "]" * 100_000
+            depth = int(os.environ.get("FAKE_PASEO_DEPTH", "100000"))
+            deep = "[" * depth + "]" * depth
             items = []
             if "-f" in sys.argv:
                 print(deep, flush=True)

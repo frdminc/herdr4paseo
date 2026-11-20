@@ -624,3 +624,21 @@ def test_every_record_field_is_size_capped_and_ascii_command_names_only():
     for ch in "\u206a\ufff9\u1160\uffa0\ufe00\U000e0100\u17b5":
         assert sanitize_text(f"a{ch}b") == "a\ufffdb", hex(ord(ch))
     assert sanitize_text("a\u200d\ufe0fb") == "a\u200d\ufe0fb"
+
+
+def test_parse_timeline_rejects_deep_nesting_and_non_objects_explicitly():
+    from herdr4paseo.core import MAX_RECORD_DEPTH, parse_timeline
+
+    ok = {"type": "tool_call", "detail": {"a": [{"b": [1]}]}}
+    assert parse_timeline(json.dumps(ok)) == [ok]
+    deep = json.dumps({"type": "x", "d": json.loads("[" * (MAX_RECORD_DEPTH + 5) + "]" * (MAX_RECORD_DEPTH + 5))})
+    with pytest.raises(ValueError, match="nested too deeply"):
+        parse_timeline(deep)
+    for raw in ("[]", "[1, 2]", '"s"', "7", "null"):
+        with pytest.raises(ValueError, match="not an object"):
+            parse_timeline(raw)
+    with pytest.raises(ValueError):  # a list nested far past any recursion limit: ValueError or RecursionError, never a crash
+        try:
+            parse_timeline("[" * 100_000 + "]" * 100_000)
+        except RecursionError as exc:
+            raise ValueError("recursion") from exc

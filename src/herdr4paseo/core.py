@@ -596,10 +596,34 @@ def timeline_argv(agent: str, *, tail: int, follow: bool = True) -> list[str]:
     return [paseo_bin(), "logs", agent, "--json", "--tail", str(tail)] + (["-f"] if follow else [])
 
 
+MAX_RECORD_DEPTH = 64  # records nest a few levels; deeper is hostile (and recursion limits differ per platform)
+
+
+def _nested_deeper_than(value: object, limit: int) -> bool:
+    """Iterative depth check, so it needs no recursion and holds on every Python/platform."""
+    stack = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
+    return False
+
+
 def parse_timeline(raw: str) -> list[dict]:
     """Accept one-shot envelopes and individual follow NDJSON records."""
-    value = json.loads(raw)
-    items = value.get("items", [value]) if isinstance(value, dict) else []
+    value = json.loads(raw)  # may itself raise RecursionError on a platform with a low C limit
+    if not isinstance(value, dict):
+        raise ValueError("timeline record is not an object")
+    if len(raw) > 2 * MAX_RECORD_DEPTH and _nested_deeper_than(value, MAX_RECORD_DEPTH):
+        raise ValueError("timeline record is nested too deeply")
+    items = value.get("items", [value])
     if not isinstance(items, list) or any(not isinstance(i, dict) or not isinstance(i.get("type"), str) for i in items):
         raise ValueError("invalid timeline items")
     return items
