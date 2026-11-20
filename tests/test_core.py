@@ -449,3 +449,57 @@ async def test_iter_record_lines_reads_past_the_stream_limit_and_skips_oversize(
     reader.feed_data(b"ok\n" + b"y" * 1_000 + b"\nafter\n")
     reader.feed_eof()
     assert [x async for x in iter_record_lines(reader, max_bytes=100, chunk_size=64)] == [b"ok\n", None, b"after\n"]
+
+
+# -- round 2: sanitizing and display budgets ------------------------------------------------------
+
+SEQUENCES = {
+    "csi": "a\x1b[2J\x1b[31mb",
+    "osc52 clipboard (ST)": "a\x1b]52;c;cHduZWQ=\x1b\\b",
+    "osc52 clipboard (BEL)": "a\x1b]52;c;cHduZWQ=\x07b",
+    "osc0/2 title": "a\x1b]0;pwned\x07\x1b]2;pwned\x1b\\b",
+    "osc8 link": "a\x1b]8;;http://evil.example\x1b\\click\x1b]8;;\x1b\\b",
+    "c1 controls": "a\x9b31m\x9d52;c;x\x9cb",
+    "other c0 and del": "a\x00\x01\x08\x0b\x0c\x0e\x1f\x7fb",
+}
+BAD = "".join(chr(c) for c in [*range(0, 9), *range(0x0B, 0x20), *range(0x7F, 0xA0)])
+
+
+def test_sanitize_text_keeps_newline_and_tab_and_drops_cr():
+    from herdr4paseo.core import sanitize_text
+
+    assert sanitize_text("a\tb\nc\r\nd") == "a\tb\nc\nd"
+    assert sanitize_text("\x1b") == "␛" and sanitize_text("\x7f") == "␡" and sanitize_text("\x9b") == "�"
+
+
+@pytest.mark.parametrize("name", SEQUENCES)
+def test_sequences_are_neutralized_in_every_chat_field_and_the_log_styler(name):
+    from herdr4paseo.core import LogStyler, render_timeline_item
+
+    s = SEQUENCES[name]
+    items = [
+        {"type": "assistant_message", "text": s},
+        {"type": "user_message", "text": s},
+        {"type": "reasoning", "text": s},
+        {"type": "tool_call", "name": s, "status": s, "detail": {"out": s}},
+        {"type": "todo", "items": [{"text": s}, s]},
+        {"type": "error", "message": s, "level": s},
+        {"type": "notification", "message": s},
+        {"type": s, "x": s},
+    ]
+    texts = [render_timeline_item(i).plain for i in items]
+    texts += [LogStyler().style(line).plain for line in (s, "[User] " + s, "[Shell] " + s, "[Thought] " + s)]
+    for text in texts:
+        assert not any(c in text for c in BAD), (name, text)
+    assert "␛" in texts[0] or name in {"c1 controls", "other c0 and del"}
+
+
+def test_render_timeline_item_clips_huge_text_and_detail_and_tolerates_wrong_types():
+    from herdr4paseo.core import MAX_DETAIL_CHARS, MAX_TEXT_CHARS, render_timeline_item
+
+    big = render_timeline_item({"type": "tool_call", "name": "Shell", "status": "ok", "detail": {"out": "x" * 2_000_000}})
+    assert len(big.plain) < MAX_DETAIL_CHARS + 500 and "more characters not shown" in big.plain
+    reply = render_timeline_item({"type": "assistant_message", "text": "y" * 2_000_000})
+    assert len(reply.plain) < MAX_TEXT_CHARS + 500
+    for item in ({"type": "assistant_message", "text": None}, {"type": "todo", "items": "abc"}, {"type": "todo", "items": [1]}):
+        render_timeline_item(item)  # no AttributeError

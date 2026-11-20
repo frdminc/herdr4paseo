@@ -35,6 +35,14 @@ elif cmd == "logs":
                 {"type": "tool_call", "callId": "big", "name": "Shell", "status": "completed", "detail": {"output": "x" * 300_000}},
                 {"type": "assistant_message", "text": "after the big record", "messageId": "m2"},
             ]
+        if mode == "escape":  # untrusted text carrying terminal control sequences
+            items = [{"type": "assistant_message", "text": "hi \x1b]52;c;cHduZWQ=\x1b\\ \x1b[2J \x1b]0;pwned\x07 \x9b31m done", "messageId": "e1"},
+                     {"type": "tool_call", "callId": "e2", "name": "Sh\x1b]8;;http://x\x1b\\ell", "status": "ok\x1b[31m"}]
+        if mode == "many":  # 300 one-character deltas, written back to back
+            items = [{"type": "assistant_message", "text": "ab"[i % 2], "messageId": "mm"} for i in range(300)]
+        if mode == "stderrbig":  # a stderr line over asyncio's 64 KiB limit
+            sys.stderr.write("e" * 200_000 + "\n")
+            sys.stderr.flush()
         if mode == "badtype":  # a wrong-typed field must be skipped, not kill the app
             items = [
                 {"type": "reasoning", "text": "a"},
@@ -49,6 +57,19 @@ elif cmd == "logs":
             print(json.dumps({"agentId": sys.argv[2], "items": items}, indent=2))
         sys.exit(0)
     tools_only = "--filter" in sys.argv
+    log_mode = os.environ.get("FAKE_PASEO_LOG_MODE", "")
+    if log_mode == "longline":  # one line over asyncio's 64 KiB StreamReader limit, then a normal one
+        print("[Shell] " + "x" * 200_000)
+        print("after the long line")
+        sys.stdout.flush()
+        time.sleep(30)
+        sys.exit(0)
+    if log_mode == "escape":
+        print("[User] hello \x1b]52;c;cHduZWQ=\x1b\\ \x1b[2J \x1b]0;pwned\x07 \x9b31m end")
+        print("plain assistant line")
+        sys.stdout.flush()
+        time.sleep(30)
+        sys.exit(0)
     print("[Shell] ls" if tools_only else "[User] hello there")
     if not tools_only:
         print("plain assistant line")

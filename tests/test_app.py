@@ -547,12 +547,20 @@ async def test_chat_follow_toggle_and_updates(calls):
         assert app.timeline[1]["text"] == "Hello **world**"
         assert "chat" in app.sub_title
         chat = app.query_one("#chat", RichLog)
-        text = "\n".join(line.text for line in chat.lines)
+        for _ in range(100):  # the render is coalesced (RENDER_SECONDS), so poll for it
+            await pilot.pause(0.05)
+            text = "\n".join(line.text for line in chat.lines)
+            if "You" in text and "world" in text and "Shell" in text:
+                break
         assert "You" in text and "world" in text and "Shell" in text
         await pilot.press("ctrl+o")
-        await pilot.pause(0.3)
         assert "tools only" in app.sub_title
-        assert "You" not in "\n".join(line.text for line in chat.lines)
+        for _ in range(100):
+            await pilot.pause(0.05)
+            joined = "\n".join(line.text for line in chat.lines)
+            if "Shell" in joined and "You" not in joined:
+                break
+        assert "Shell" in joined and "You" not in joined
         await pilot.press("ctrl+v")
         await settle(pilot, app, "[Shell] ls")
         assert not app.chat_view
@@ -629,3 +637,90 @@ async def test_chat_skips_a_wrong_typed_record_and_keeps_running(calls, monkeypa
         assert any(i.get("text") == "still alive" for i in app.timeline)
         assert "invalid timeline JSON record" in log_text(app)
         assert app.is_running
+
+
+# -- round 2: control sequences, long log/stderr lines, coalesced rendering ----------------------
+
+CONTROL_CHARS = "\x1b\x9b\x9d\x00\x07\x7f"
+
+
+def all_text(app: Herdr4PaseoApp, widget: str) -> str:
+    return "\n".join(line.text for line in app.query_one(widget, RichLog).lines)
+
+
+async def test_plain_log_neutralizes_terminal_escapes(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_LOG_MODE", "escape")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        text = log_text(app)
+        assert "hello" in text and "52;c;" in text  # payload stays visible, inert
+        assert not any(c in text for c in CONTROL_CHARS)
+        for line in app.query_one("#log", RichLog).lines:
+            assert not any(c in "".join(seg.text for seg in line) for c in CONTROL_CHARS)
+
+
+async def test_chat_neutralizes_terminal_escapes(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_JSON_MODE", "escape")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+v")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if "done" in all_text(app, "#chat") and "ell" in all_text(app, "#chat"):
+                break
+        text = all_text(app, "#chat")
+        assert "pwned" in text and "52;c;" in text
+        assert not any(c in text for c in CONTROL_CHARS)
+
+
+async def test_plain_log_survives_a_line_over_the_stream_limit(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_LOG_MODE", "longline")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "after the long line")
+        assert app.is_running and "[Shell]" in log_text(app) and "x" * 40 in log_text(app)
+
+
+async def test_plain_log_skips_a_line_over_the_cap_with_a_notice(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_LOG_MODE", "longline")
+    monkeypatch.setattr(app_module, "MAX_LOG_LINE_BYTES", 100_000)
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "after the long line")
+        assert "skipped a log line over" in log_text(app) and "xxxx" not in log_text(app)
+
+
+async def test_chat_survives_a_stderr_line_over_the_stream_limit(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_JSON_MODE", "stderrbig")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+v")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if len(app.timeline) == 3 and "eeee" in log_text(app):
+                break
+        assert len(app.timeline) == 3 and "eeee" in log_text(app)
+        assert app.is_running
+
+
+async def test_chat_coalesces_rerenders_of_many_fragments(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_JSON_MODE", "many")
+    rendered = []
+    real = app_module.render_timeline_item
+    monkeypatch.setattr(app_module, "render_timeline_item", lambda item: rendered.append(item["type"]) or real(item))
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+v")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if app.timeline and len(app.timeline[0].get("text", "")) == 300 and app._render_timer is None:
+                break
+        assert len(app.timeline) == 1 and app.timeline[0]["text"] == "ab" * 150
+        await pilot.pause(0.3)
+        assert "abab" in all_text(app, "#chat")
+    # 300 fragments must not mean 300 renders (200 would still be N full re-renders)
+    assert 1 <= len(rendered) <= 30, len(rendered)

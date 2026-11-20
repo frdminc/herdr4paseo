@@ -418,6 +418,7 @@ class LogStyler:
         self._syntax = None
 
     def style(self, line: str) -> Text:
+        line = sanitize_text(line)
         banner = _FOLLOW_BANNER.match(line)
         if banner:
             return Text(f"--- following live (last {banner.group(1)} entries) ---", style=style_for("meta"))
@@ -572,30 +573,66 @@ def parse_timeline(raw: str) -> list[dict]:
     return items
 
 
+_CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+MAX_TEXT_CHARS = 256_000  # displayed per timeline item; the full text stays in memory
+MAX_DETAIL_CHARS = 64_000  # displayed tool-call detail
+
+
+def _visible_control(match: re.Match[str]) -> str:
+    code = ord(match.group())
+    if code < 0x20:
+        return chr(0x2400 + code)  # the Control Pictures glyph, e.g. U+241B for ESC
+    return "\u2421" if code == 0x7F else "\ufffd"  # DEL, C1
+
+
+def sanitize_text(text: str) -> str:
+    """Make agent/tool text inert before it reaches Rich and the terminal.
+
+    Rich strips only BEL/BS/VT/FF/CR and Textual writes the rest as is, so ESC, C1 and other
+    control characters would let untrusted text drive the terminal (CSI, OSC 0/2 titles, OSC 8
+    links, OSC 52 clipboard writes). They become visible stand-ins; `\n` and `\t` stay, CR is dropped.
+    """
+    return _CONTROLS.sub(_visible_control, text.replace("\r", ""))
+
+
+def _clean(value: object, limit: int = MAX_TEXT_CHARS) -> str:
+    """str(value), clipped to a display budget, then sanitized (never raises on a wrong-typed field)."""
+    text = value if isinstance(value, str) else str(value)
+    if len(text) > limit:
+        text = f"{text[:limit]}\n... {len(text) - limit} more characters not shown"
+    return sanitize_text(text)
+
+
 def render_timeline_item(item: dict) -> Text:
-    """Role labels survive NO_COLOR; assistant markdown shares the log styler."""
+    """Role labels survive NO_COLOR; assistant markdown shares the log styler. All text is sanitized."""
     kind = item["type"]
     if kind == "assistant_message":
         result = Text("Assistant\n", style=style_for("md.heading"))
         styler = LogStyler()
-        for line in item.get("text", "").splitlines():
+        for line in _clean(item.get("text", "")).splitlines():
             result.append_text(styler.style(line))
             result.append("\n")
         return result
     if kind in {"user_message", "reasoning"}:
         label, token = ("You", "user.text") if kind == "user_message" else ("Reasoning", "thought")
-        return Text(f"{label}\n{item.get('text', '')}", style=style_for(token))
+        return Text(f"{label}\n{_clean(item.get('text', ''))}", style=style_for(token))
     if kind == "tool_call":
-        status = item.get("status", "running")
-        result = Text(f"{item.get('name', 'Tool')} · {status}", style=style_for("tool.failed" if status == "failed" else "tool.tag"))
+        status = _clean(item.get("status", "running"), 100)
+        result = Text(f"{_clean(item.get('name', 'Tool'), 200)} · {status}", style=style_for("tool.failed" if status == "failed" else "tool.tag"))
         if item.get("detail"):
-            result.append("\n" + json.dumps(item["detail"], ensure_ascii=False, indent=2), style=style_for("tool.detail"))
+            detail = json.dumps(item["detail"], ensure_ascii=False, indent=2, default=str)
+            result.append("\n" + _clean(detail, MAX_DETAIL_CHARS), style=style_for("tool.detail"))
         return result
     if kind == "todo":
-        return Text("Tasks\n" + "\n".join(f"[{'x' if t.get('completed') else ' '}] {t.get('text', t.get('description', ''))}" for t in item.get("items", [])), style=style_for("tool.detail"))
+        entries = item.get("items", [])
+        rows = [t if isinstance(t, dict) else {"text": t} for t in (entries if isinstance(entries, list) else [entries])]
+        body = "\n".join(f"[{'x' if t.get('completed') else ' '}] {_clean(t.get('text', t.get('description', '')), 2_000)}" for t in rows)
+        return Text("Tasks\n" + body, style=style_for("tool.detail"))
     if kind in {"error", "notification"}:
-        return Text(f"[{item.get('level', kind)}] {item.get('message', '')}", style=style_for("error.text" if kind == "error" or item.get("level") == "error" else "permission"))
-    return Text(f"[{kind}] " + json.dumps({k: v for k, v in item.items() if k != "type"}, ensure_ascii=False), style=style_for("meta"))
+        level = _clean(item.get("level", kind), 100)
+        return Text(f"[{level}] {_clean(item.get('message', ''))}", style=style_for("error.text" if kind == "error" or level == "error" else "permission"))
+    rest = json.dumps({k: v for k, v in item.items() if k != "type"}, ensure_ascii=False, default=str)
+    return Text(f"[{_clean(kind, 100)}] " + _clean(rest, MAX_DETAIL_CHARS), style=style_for("meta"))
 
 
 STREAMING_TEXT_TYPES = frozenset({"assistant_message", "reasoning"})
@@ -631,7 +668,8 @@ def apply_timeline_item(timeline: list[dict], item: dict, open_chain: int | None
     return None
 
 
-MAX_RECORD_BYTES = 32 * 1024 * 1024  # one `paseo logs --json` record; larger ones are skipped, not buffered
+MAX_RECORD_BYTES = 8 * 1024 * 1024  # one `paseo logs --json` record; larger ones are skipped, not buffered
+MAX_LOG_LINE_BYTES = 1024 * 1024  # one plain-log line or stderr line
 
 
 async def iter_record_lines(stream, max_bytes: int = MAX_RECORD_BYTES, chunk_size: int = 1 << 16):

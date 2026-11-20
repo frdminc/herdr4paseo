@@ -17,6 +17,7 @@ from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.content import Content
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -39,7 +40,9 @@ from .core import (
     history_path,
     load_history,
     logs_argv,
+    MAX_LOG_LINE_BYTES,
     MAX_RECORD_BYTES,
+    sanitize_text,
     apply_timeline_item,
     iter_record_lines,
     timeline_argv,
@@ -62,6 +65,7 @@ from .core import (
 from .daemon import DaemonError, fetch_commands
 
 STATUS_POLL_SECONDS = 3.0
+RENDER_SECONDS = 0.1  # at most ~10 chat re-renders a second however fast records arrive
 RECONNECT_SECONDS = 3.0
 
 
@@ -292,6 +296,8 @@ class Herdr4PaseoApp(App[None]):
         self.tools_only = False
         self.chat_view = False
         self.timeline: list[dict] = []
+        self._rendered: list[tuple[dict, Text]] = []  # render cache aligned with self.timeline
+        self._render_timer = None  # pending coalesced render
         self._open_chain: int | None = None  # index of the assistant/reasoning text still receiving deltas
         self.agent: Agent | None = None
         self._history: list[str] = load_history(history_path())
@@ -413,7 +419,7 @@ class Herdr4PaseoApp(App[None]):
 
     def _note(self, message: str, token: str) -> None:
         """Write one of herdr4paseo's own lines to the log, styled by a core.THEME token."""
-        self.query_one("#log", RichLog).write(Text(message, style=style_for(token)))
+        self.query_one("#log", RichLog).write(Text(sanitize_text(message), style=style_for(token)))
 
     @work(exclusive=True, group="stream")
     async def _start_stream(self) -> None:
@@ -437,7 +443,10 @@ class Herdr4PaseoApp(App[None]):
             )
             try:
                 assert proc.stdout is not None
-                while line := await proc.stdout.readline():
+                async for line in iter_record_lines(proc.stdout, MAX_LOG_LINE_BYTES):
+                    if line is None:  # no 64 KiB readline() limit: a huge line is skipped with a notice
+                        self._note(f"skipped a log line over {MAX_LOG_LINE_BYTES >> 10} KiB", "error.text")
+                        continue
                     log.write(styler.style(line.decode(errors="replace").rstrip("\n")))
                 rc = await proc.wait()
             finally:
@@ -449,14 +458,37 @@ class Herdr4PaseoApp(App[None]):
             await asyncio.sleep(RECONNECT_SECONDS)
 
     def _apply_timeline(self, raw: str) -> None:
+        """Fold records into the timeline now; the visible re-render is coalesced (RENDER_SECONDS)."""
         for item in parse_timeline(raw):
             self._open_chain = apply_timeline_item(self.timeline, item, self._open_chain)
-        log = self.query_one("#chat", RichLog)
+        if self._render_timer is None:
+            self._render_timer = self.set_timer(RENDER_SECONDS, self._render_timeline)
+
+    def _render_timeline(self) -> None:
+        self._render_timer = None
+        cache = self._rendered
+        rendered: list[tuple[dict, Text]] = []
+        try:
+            log = self.query_one("#chat", RichLog)
+        except NoMatches:  # the timer fired while the app was shutting down
+            return
         log.clear()
-        for item in self.timeline:
+        for i, item in enumerate(self.timeline):
+            # apply_timeline_item swaps in a new dict for every change, so `is` finds the unchanged items
+            text = cache[i][1] if i < len(cache) and cache[i][0] is item else render_timeline_item(item)
+            rendered.append((item, text))
             if not self.tools_only or item["type"] == "tool_call":
-                log.write(render_timeline_item(item))
+                log.write(text)
                 log.write("")
+        self._rendered = rendered
+
+    def _reset_timeline(self) -> None:
+        self.timeline, self._rendered, self._open_chain = [], [], None
+        if self._render_timer is not None:
+            self._render_timer.stop()
+            self._render_timer = None
+        with contextlib.suppress(NoMatches):
+            self.query_one("#chat", RichLog).clear()
 
     @work(exclusive=True, group="chat-stream")
     async def _start_chat_stream(self) -> None:
@@ -464,9 +496,7 @@ class Herdr4PaseoApp(App[None]):
             return
         agent_id = self.agent.id
         while True:
-            self.timeline = []
-            self._open_chain = None
-            self.query_one("#chat", RichLog).clear()
+            self._reset_timeline()
             proc = await asyncio.create_subprocess_exec(
                 *timeline_argv(agent_id, tail=self._tail),
                 stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
@@ -474,14 +504,15 @@ class Herdr4PaseoApp(App[None]):
             )
             async def notices() -> None:
                 assert proc.stderr is not None
-                while line := await proc.stderr.readline():
-                    self._note(line.decode(errors="replace").rstrip(), "meta")
+                async for line in iter_record_lines(proc.stderr, MAX_LOG_LINE_BYTES):
+                    self._note("skipped a stderr line over %d KiB" % (MAX_LOG_LINE_BYTES >> 10) if line is None
+                               else line.decode(errors="replace").rstrip(), "meta")
             reader = asyncio.create_task(notices())
             try:
                 assert proc.stdout is not None
                 async for line in iter_record_lines(proc.stdout, MAX_RECORD_BYTES):
                     if line is None:
-                        self._note(f"skipped a timeline record over {MAX_RECORD_BYTES >> 20} MiB", "error.text")
+                        self._note(f"skipped a timeline record over {MAX_RECORD_BYTES >> 10} KiB", "error.text")
                         continue
                     try:
                         self._apply_timeline(line.decode(errors="replace"))
