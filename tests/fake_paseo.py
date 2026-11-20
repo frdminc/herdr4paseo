@@ -21,12 +21,20 @@ if cmd == "ls":
     print(json.dumps(AGENTS))
 elif cmd == "logs":
     if "--json" in sys.argv:
+        # Follow-mode records are deltas: three fragments with one messageId concatenate.
+        mode = os.environ.get("FAKE_PASEO_JSON_MODE", "")
         items = [
             {"type": "user_message", "text": "hello chat"},
-            {"type": "assistant_message", "text": "Hello", "messageId": "m1"},
-            {"type": "assistant_message", "text": "Hello **world**", "messageId": "m1"},
+            {"type": "assistant_message", "text": "Hel", "messageId": "m1"},
+            {"type": "assistant_message", "text": "lo ", "messageId": "m1"},
+            {"type": "assistant_message", "text": "**world**", "messageId": "m1"},
             {"type": "tool_call", "callId": "c1", "name": "Shell", "status": "completed", "detail": {"output": "done"}},
         ]
+        if mode == "big":  # one record far over asyncio's 64 KiB StreamReader limit, then a normal one
+            items = [
+                {"type": "tool_call", "callId": "big", "name": "Shell", "status": "completed", "detail": {"output": "x" * 300_000}},
+                {"type": "assistant_message", "text": "after the big record", "messageId": "m2"},
+            ]
         if "-f" in sys.argv:
             for item in items:
                 print(json.dumps(item), flush=True)

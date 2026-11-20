@@ -39,6 +39,9 @@ from .core import (
     history_path,
     load_history,
     logs_argv,
+    MAX_RECORD_BYTES,
+    apply_timeline_item,
+    iter_record_lines,
     timeline_argv,
     parse_timeline,
     render_timeline_item,
@@ -289,6 +292,7 @@ class Herdr4PaseoApp(App[None]):
         self.tools_only = False
         self.chat_view = False
         self.timeline: list[dict] = []
+        self._open_chain: int | None = None  # index of the assistant/reasoning text still receiving deltas
         self.agent: Agent | None = None
         self._history: list[str] = load_history(history_path())
         self._last_status: str | None = None
@@ -446,17 +450,7 @@ class Herdr4PaseoApp(App[None]):
 
     def _apply_timeline(self, raw: str) -> None:
         for item in parse_timeline(raw):
-            identity = item.get("messageId") or item.get("callId")
-            index = next((i for i, old in enumerate(self.timeline) if identity and old["type"] == item["type"] and (old.get("messageId") or old.get("callId")) == identity), None)
-            # Older providers omit messageId: contiguous growing assistant text is a snapshot.
-            if index is None and not identity and item["type"] == "assistant_message" and self.timeline:
-                old = self.timeline[-1]
-                if old["type"] == item["type"] and item.get("text", "").startswith(old.get("text", "")):
-                    index = len(self.timeline) - 1
-            if index is None:
-                self.timeline.append(item)
-            else:
-                self.timeline[index] = item
+            self._open_chain = apply_timeline_item(self.timeline, item, self._open_chain)
         log = self.query_one("#chat", RichLog)
         log.clear()
         for item in self.timeline:
@@ -471,6 +465,7 @@ class Herdr4PaseoApp(App[None]):
         agent_id = self.agent.id
         while True:
             self.timeline = []
+            self._open_chain = None
             self.query_one("#chat", RichLog).clear()
             proc = await asyncio.create_subprocess_exec(
                 *timeline_argv(agent_id, tail=self._tail),
@@ -484,7 +479,10 @@ class Herdr4PaseoApp(App[None]):
             reader = asyncio.create_task(notices())
             try:
                 assert proc.stdout is not None
-                while line := await proc.stdout.readline():
+                async for line in iter_record_lines(proc.stdout, MAX_RECORD_BYTES):
+                    if line is None:
+                        self._note(f"skipped a timeline record over {MAX_RECORD_BYTES >> 20} MiB", "error.text")
+                        continue
                     try:
                         self._apply_timeline(line.decode(errors="replace"))
                     except (ValueError, json.JSONDecodeError):

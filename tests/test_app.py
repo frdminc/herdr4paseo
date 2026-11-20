@@ -570,3 +570,47 @@ async def test_chat_one_shot_envelope(calls):
         app._apply_timeline(out)
         assert len(app.timeline) == 3
         assert app.timeline[1]["text"] == "Hello **world**"
+
+
+async def test_chat_concatenates_streaming_fragments(calls):
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+v")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if len(app.timeline) == 3:
+                break
+        assert [i.get("text") for i in app.timeline if i["type"] == "assistant_message"] == ["Hello **world**"]
+
+
+async def test_chat_survives_a_record_over_the_stream_limit(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_JSON_MODE", "big")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+v")
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if len(app.timeline) == 2:
+                break
+        assert len(app.timeline) == 2
+        assert len(app.timeline[0]["detail"]["output"]) == 300_000
+        assert app.timeline[1]["text"] == "after the big record"
+        assert app.is_running
+
+
+async def test_chat_skips_an_oversized_record_with_a_notice(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_JSON_MODE", "big")
+    monkeypatch.setattr(app_module, "MAX_RECORD_BYTES", 100_000)  # the 300 KB record is over, the next one is not
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+v")
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if any(i["type"] == "assistant_message" for i in app.timeline):
+                break
+        assert [i["type"] for i in app.timeline] == ["assistant_message"]
+        assert "skipped a timeline record over" in log_text(app)
+        assert app.is_running

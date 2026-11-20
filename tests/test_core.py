@@ -377,3 +377,75 @@ def test_link_label_escalates_relative_to_its_line():
     cont.style("[User] first")
     tail = cont.style("see https://a.io")
     assert style_at(tail, tail.plain.index("a.io")).italic
+
+
+# -- chat timeline: delta folding and large records -------------------------------------
+
+
+def _fold(items):
+    from herdr4paseo.core import apply_timeline_item
+
+    timeline, chain = [], None
+    for item in items:
+        chain = apply_timeline_item(timeline, item, chain)
+    return timeline
+
+
+def test_timeline_three_fragments_with_one_id_concatenate():
+    frags = ["Hel", "lo ", "**world**"]
+    timeline = _fold({"type": "assistant_message", "text": t, "messageId": "m1"} for t in frags)
+    assert [i["text"] for i in timeline] == ["Hello **world**"]
+
+
+def test_timeline_idless_fragments_chain_like_upstream():
+    # createFollowTranscriptWriter: a fragment without messageId continues the open chain.
+    timeline = _fold([
+        {"type": "assistant_message", "text": "a", "messageId": "m1"},
+        {"type": "assistant_message", "text": "b"},
+        {"type": "assistant_message", "text": "c"},
+        {"type": "reasoning", "text": "x"},
+        {"type": "reasoning", "text": "y"},
+    ])
+    assert [(i["type"], i["text"]) for i in timeline] == [("assistant_message", "abc"), ("reasoning", "xy")]
+
+
+def test_timeline_new_message_id_other_type_or_other_item_starts_a_new_chain():
+    timeline = _fold([
+        {"type": "assistant_message", "text": "one", "messageId": "m1"},
+        {"type": "assistant_message", "text": "two", "messageId": "m2"},
+        {"type": "tool_call", "callId": "c1", "name": "Shell", "status": "running"},
+        {"type": "assistant_message", "text": "three", "messageId": "m2"},  # chain was closed by the tool call
+        {"type": "user_message", "text": "hi"},
+        {"type": "assistant_message", "text": "four"},
+    ])
+    assert [i["text"] for i in timeline if "text" in i] == ["one", "two", "three", "hi", "four"]
+
+
+def test_timeline_tool_call_updates_replace_in_place_without_closing_text():
+    timeline = _fold([
+        {"type": "tool_call", "callId": "c1", "name": "Shell", "status": "running"},
+        {"type": "tool_call", "callId": "c1", "name": "Shell", "status": "completed"},
+    ])
+    assert len(timeline) == 1 and timeline[0]["status"] == "completed"
+
+
+async def test_iter_record_lines_reads_past_the_stream_limit_and_skips_oversize():
+    import asyncio
+
+    from herdr4paseo.core import iter_record_lines
+
+    big = b'{"x":"' + b"a" * 200_000 + b'"}\n'  # > asyncio's default 64 KiB limit
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"first\n" + big + b"x" * 5_000 + b"\nlast")
+    reader.feed_eof()
+    assert [len(x) if x else x async for x in iter_record_lines(reader)] == [6, len(big), 5_001, 4]
+    with pytest.raises(ValueError):  # what the old readline() loop hit
+        small = asyncio.StreamReader()
+        small.feed_data(big)
+        small.feed_eof()
+        await small.readline()
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"ok\n" + b"y" * 1_000 + b"\nafter\n")
+    reader.feed_eof()
+    assert [x async for x in iter_record_lines(reader, max_bytes=100, chunk_size=64)] == [b"ok\n", None, b"after\n"]

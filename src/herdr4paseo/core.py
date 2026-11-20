@@ -596,3 +596,69 @@ def render_timeline_item(item: dict) -> Text:
     if kind in {"error", "notification"}:
         return Text(f"[{item.get('level', kind)}] {item.get('message', '')}", style=style_for("error.text" if kind == "error" or item.get("level") == "error" else "permission"))
     return Text(f"[{kind}] " + json.dumps({k: v for k, v in item.items() if k != "type"}, ensure_ascii=False), style=style_for("meta"))
+
+
+STREAMING_TEXT_TYPES = frozenset({"assistant_message", "reasoning"})
+
+
+def apply_timeline_item(timeline: list[dict], item: dict, open_chain: int | None) -> int | None:
+    """Fold one `paseo logs --json` record into `timeline`; returns the new open text chain index.
+
+    Follow-mode records are deltas, not snapshots (upstream `createFollowTranscriptWriter` does
+    `chain.buffer += item.text`, `createFollowJsonWriter` emits each item unchanged), so
+    assistant/reasoning text is appended. A chain continues only while the previous record was
+    the same type; an assistant fragment continues it when it has no `messageId` or the same one
+    (upstream `continuesChain`); any other record closes it. Tool calls are snapshots keyed by
+    `callId`: an update replaces its earlier record in place.
+    """
+    kind = item["type"]
+    if kind in STREAMING_TEXT_TYPES:
+        if open_chain is not None:
+            old = timeline[open_chain]
+            same_message = kind != "assistant_message" or not item.get("messageId") or item.get("messageId") == old.get("messageId")
+            if old["type"] == kind and same_message:
+                timeline[open_chain] = {**old, "text": old.get("text", "") + item.get("text", "")}
+                return open_chain
+        timeline.append(dict(item))
+        return len(timeline) - 1
+    call_id = item.get("callId")
+    if kind == "tool_call" and call_id:
+        for i, old in enumerate(timeline):
+            if old["type"] == kind and old.get("callId") == call_id:
+                timeline[i] = item
+                return None
+    timeline.append(item)
+    return None
+
+
+MAX_RECORD_BYTES = 32 * 1024 * 1024  # one `paseo logs --json` record; larger ones are skipped, not buffered
+
+
+async def iter_record_lines(stream, max_bytes: int = MAX_RECORD_BYTES, chunk_size: int = 1 << 16):
+    """Yield newline-terminated lines from an asyncio stream with no 64 KiB `readline()` limit.
+
+    A line longer than `max_bytes` is dropped (memory stays bounded) and yielded as `None` once,
+    so the caller can show a notice and keep going. A final unterminated line is still yielded.
+    """
+    pending = bytearray()
+    skipping = False
+    while chunk := await stream.read(chunk_size):
+        while chunk:
+            end = chunk.find(b"\n")
+            piece, chunk = (chunk, b"") if end < 0 else (chunk[: end + 1], chunk[end + 1 :])
+            if not skipping:
+                pending += piece
+                if len(pending) > max_bytes + 1:
+                    pending.clear()
+                    skipping = True
+            if end >= 0:
+                if skipping:
+                    skipping = False
+                    yield None
+                else:
+                    yield bytes(pending)
+                    pending.clear()
+    if skipping:
+        yield None
+    elif pending:
+        yield bytes(pending)
