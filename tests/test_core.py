@@ -377,3 +377,268 @@ def test_link_label_escalates_relative_to_its_line():
     cont.style("[User] first")
     tail = cont.style("see https://a.io")
     assert style_at(tail, tail.plain.index("a.io")).italic
+
+
+# -- chat timeline: delta folding and large records -------------------------------------
+
+
+def _fold(items):
+    from herdr4paseo.core import apply_timeline_item
+
+    timeline, chain = [], None
+    for item in items:
+        chain = apply_timeline_item(timeline, item, chain)
+    return timeline
+
+
+def test_timeline_three_fragments_with_one_id_concatenate():
+    frags = ["Hel", "lo ", "**world**"]
+    timeline = _fold({"type": "assistant_message", "text": t, "messageId": "m1"} for t in frags)
+    assert [i["text"] for i in timeline] == ["Hello **world**"]
+
+
+def test_timeline_idless_fragments_chain_like_upstream():
+    # createFollowTranscriptWriter: a fragment without messageId continues the open chain.
+    timeline = _fold([
+        {"type": "assistant_message", "text": "a", "messageId": "m1"},
+        {"type": "assistant_message", "text": "b"},
+        {"type": "assistant_message", "text": "c"},
+        {"type": "reasoning", "text": "x"},
+        {"type": "reasoning", "text": "y"},
+    ])
+    assert [(i["type"], i["text"]) for i in timeline] == [("assistant_message", "abc"), ("reasoning", "xy")]
+
+
+def test_timeline_new_message_id_other_type_or_other_item_starts_a_new_chain():
+    timeline = _fold([
+        {"type": "assistant_message", "text": "one", "messageId": "m1"},
+        {"type": "assistant_message", "text": "two", "messageId": "m2"},
+        {"type": "tool_call", "callId": "c1", "name": "Shell", "status": "running"},
+        {"type": "assistant_message", "text": "three", "messageId": "m2"},  # chain was closed by the tool call
+        {"type": "user_message", "text": "hi"},
+        {"type": "assistant_message", "text": "four"},
+    ])
+    assert [i["text"] for i in timeline if "text" in i] == ["one", "two", "three", "hi", "four"]
+
+
+def test_timeline_tool_call_updates_replace_in_place_without_closing_text():
+    timeline = _fold([
+        {"type": "tool_call", "callId": "c1", "name": "Shell", "status": "running"},
+        {"type": "tool_call", "callId": "c1", "name": "Shell", "status": "completed"},
+    ])
+    assert len(timeline) == 1 and timeline[0]["status"] == "completed"
+
+
+async def test_iter_record_lines_reads_past_the_stream_limit_and_skips_oversize():
+    import asyncio
+
+    from herdr4paseo.core import iter_record_lines
+
+    big = b'{"x":"' + b"a" * 200_000 + b'"}\n'  # > asyncio's default 64 KiB limit
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"first\n" + big + b"x" * 5_000 + b"\nlast")
+    reader.feed_eof()
+    assert [len(x) if x else x async for x in iter_record_lines(reader)] == [6, len(big), 5_001, 4]
+    with pytest.raises(ValueError):  # what the old readline() loop hit
+        small = asyncio.StreamReader()
+        small.feed_data(big)
+        small.feed_eof()
+        await small.readline()
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"ok\n" + b"y" * 1_000 + b"\nafter\n")
+    reader.feed_eof()
+    assert [x async for x in iter_record_lines(reader, max_bytes=100, chunk_size=64)] == [b"ok\n", None, b"after\n"]
+
+
+# -- round 2: sanitizing and display budgets ------------------------------------------------------
+
+SEQUENCES = {
+    "csi": "a\x1b[2J\x1b[31mb",
+    "osc52 clipboard (ST)": "a\x1b]52;c;cHduZWQ=\x1b\\b",
+    "osc52 clipboard (BEL)": "a\x1b]52;c;cHduZWQ=\x07b",
+    "osc0/2 title": "a\x1b]0;pwned\x07\x1b]2;pwned\x1b\\b",
+    "osc8 link": "a\x1b]8;;http://evil.example\x1b\\click\x1b]8;;\x1b\\b",
+    "c1 controls": "a\x9b31m\x9d52;c;x\x9cb",
+    "other c0 and del": "a\x00\x01\x08\x0b\x0c\x0e\x1f\x7fb",
+}
+BAD = "".join(chr(c) for c in [*range(0, 9), *range(0x0B, 0x20), *range(0x7F, 0xA0)])
+
+
+def test_sanitize_text_keeps_newline_and_tab_and_drops_cr():
+    from herdr4paseo.core import sanitize_text
+
+    assert sanitize_text("a\tb\nc\r\nd") == "a\tb\nc\nd"
+    assert sanitize_text("\x1b") == "␛" and sanitize_text("\x7f") == "␡" and sanitize_text("\x9b") == "�"
+
+
+@pytest.mark.parametrize("name", SEQUENCES)
+def test_sequences_are_neutralized_in_every_chat_field_and_the_log_styler(name):
+    from herdr4paseo.core import LogStyler, render_timeline_item
+
+    s = SEQUENCES[name]
+    items = [
+        {"type": "assistant_message", "text": s},
+        {"type": "user_message", "text": s},
+        {"type": "reasoning", "text": s},
+        {"type": "tool_call", "name": s, "status": s, "detail": {"out": s}},
+        {"type": "todo", "items": [{"text": s}, s]},
+        {"type": "error", "message": s, "level": s},
+        {"type": "notification", "message": s},
+        {"type": s, "x": s},
+    ]
+    texts = [render_timeline_item(i).plain for i in items]
+    texts += [LogStyler().style(line).plain for line in (s, "[User] " + s, "[Shell] " + s, "[Thought] " + s)]
+    for text in texts:
+        assert not any(c in text for c in BAD), (name, text)
+    assert "␛" in texts[0] or name in {"c1 controls", "other c0 and del"}
+
+
+def test_render_timeline_item_clips_huge_text_and_detail_and_tolerates_wrong_types():
+    from herdr4paseo.core import MAX_DETAIL_CHARS, MAX_TEXT_CHARS, render_timeline_item
+
+    big = render_timeline_item({"type": "tool_call", "name": "Shell", "status": "ok", "detail": {"out": "x" * 2_000_000}})
+    assert len(big.plain) < MAX_DETAIL_CHARS + 500 and "more characters not shown" in big.plain
+    reply = render_timeline_item({"type": "assistant_message", "text": "y" * 2_000_000})
+    assert len(reply.plain) < MAX_TEXT_CHARS + 500
+    for item in ({"type": "assistant_message", "text": None}, {"type": "todo", "items": "abc"}, {"type": "todo", "items": [1]}):
+        render_timeline_item(item)  # no AttributeError
+
+
+# -- round 3: labels, bidi/zero-width, bounds -------------------------------------------------------
+
+
+def test_sanitize_text_neutralizes_bidi_zero_width_and_separators_but_keeps_zwj():
+    from herdr4paseo.core import sanitize_text
+
+    for ch in "‮‪⁦⁩‎‏؜​⁠﻿  ":
+        assert sanitize_text(f"a{ch}b") == "a�b", hex(ord(ch))
+    assert sanitize_text("\U0001f3f3️‍\U0001f308 e‌n") == "\U0001f3f3️‍\U0001f308 e‌n"
+
+
+def test_agent_permission_and_command_labels_are_inert_single_lines():
+    from herdr4paseo.core import Agent, Command, Permission, agent_label_text, parse_commands
+
+    conceal = "rm -rf ~\x1b[8m hidden\x1b]52;c;eA==\x07\n  - ALLOW fake‮"
+    agent = Agent(id="i", short_id="s\x1b[2J", name=conceal, provider="p\x9b", status="running", cwd="/c\x1b]0;t\x07")
+    perm = Permission(id="1", agent_id="i", name="Bash\x1b[8m", description=conceal)
+    cmd = Command(name="ok", description=conceal, argument_hint="<a\x1b>", kind="command")
+    for label in (agent.label, perm.label, cmd.label, agent_label_text(agent).plain):
+        assert "\n" not in label and not any(c in label for c in "\x1b\x07\x9b‮"), label
+    assert "rm -rf ~" in perm.label  # still shown, just inert
+    names = [c.name for c in parse_commands([{"name": "good"}, {"name": "ev\x1bil"}, {"name": "sp ace"}, {"name": "tab\tx"}])]
+    assert names == ["good"]
+
+
+def test_trim_timeline_drops_in_batches_and_shifts_the_open_chain():
+    from herdr4paseo.core import MAX_TIMELINE_ITEMS, TRIM_BATCH, trim_timeline
+
+    tl = [{"type": "user_message", "text": str(i)} for i in range(MAX_TIMELINE_ITEMS + TRIM_BATCH)]
+    assert trim_timeline(tl, 5) == (5, 0) and len(tl) == MAX_TIMELINE_ITEMS + TRIM_BATCH
+    tl.append({"type": "user_message", "text": "x"})
+    chain, dropped = trim_timeline(tl, len(tl) - 1)
+    assert dropped == TRIM_BATCH and chain == len(tl) - 1 and tl[0]["text"] == str(TRIM_BATCH)
+    assert trim_timeline([{"type": "x"}] * (MAX_TIMELINE_ITEMS + TRIM_BATCH + 1), 3)[0] is None  # chain fell off
+
+
+def test_link_highlighting_skips_pathologically_long_lines():
+    from herdr4paseo.core import MAX_HIGHLIGHT_LINE, LogStyler
+
+    line = "see https://example.com/x " * (MAX_HIGHLIGHT_LINE // 20)
+    assert len(line) > MAX_HIGHLIGHT_LINE
+    assert LogStyler().style(line).spans == []
+    assert LogStyler().style("see https://example.com/x").spans  # short lines still highlight
+
+
+# -- round 4: regex backtracking, caps, parsing guards ----------------------------------------------
+
+
+def test_link_regexes_do_not_backtrack_quadratically_inside_the_gate():
+    import time
+
+    from herdr4paseo.core import MAX_HIGHLIGHT_LINE, LogStyler, render_timeline_item
+
+    for unit in ("[", "[a](", "[a](b", "](", "`", "http://"):
+        line = (unit * MAX_HIGHLIGHT_LINE)[: MAX_HIGHLIGHT_LINE - 1]
+        start = time.perf_counter()
+        LogStyler().style(line)
+        assert time.perf_counter() - start < 0.2, unit
+    start = time.perf_counter()
+    render_timeline_item({"type": "assistant_message", "text": "\n".join("[" * 4_999 for _ in range(51))})
+    assert time.perf_counter() - start < 2
+
+
+def test_streamed_text_and_huge_tool_detail_are_capped_in_storage():
+    from herdr4paseo.core import MAX_DETAIL_CHARS, STORE_TEXT_LIMIT, apply_timeline_item
+
+    timeline, chain = [], None
+    for _ in range(40):
+        chain = apply_timeline_item(timeline, {"type": "assistant_message", "text": "x" * 100_000, "messageId": "m"}, chain)
+    assert len(timeline) == 1 and len(timeline[0]["text"]) == STORE_TEXT_LIMIT
+    apply_timeline_item(timeline, {"type": "tool_call", "callId": "c", "name": "S", "detail": {"o": "y" * 5_000_000}}, None)
+    assert len(timeline[1]["detail"]) < 5 * MAX_DETAIL_CHARS
+
+
+def test_trim_timeline_drops_several_batches_when_far_over():
+    from herdr4paseo.core import MAX_TIMELINE_ITEMS, TRIM_BATCH, trim_timeline
+
+    tl = [{"type": "user_message", "text": "x"}] * 5_000
+    chain, dropped = trim_timeline(tl, 4_999)
+    assert len(tl) <= MAX_TIMELINE_ITEMS + TRIM_BATCH and dropped % TRIM_BATCH == 0 and chain == len(tl) - 1
+
+
+def test_invisible_format_characters_and_tag_characters_are_neutralized():
+    from herdr4paseo.core import parse_commands, sanitize_text
+
+    for ch in "­͏ᅟ឴᠎⁡⁤ㅤ\U000e0041":
+        assert sanitize_text(f"a{ch}b") == "a�b", hex(ord(ch))
+    assert [c.name for c in parse_commands([{"name": "he­lp"}, {"name": "he\U000e0041lp"}, {"name": "git:commit-all.v2/x"}, {"name": "résumé"}])] == ["git:commit-all.v2/x"]  # ASCII names only
+
+
+def test_listing_parsers_skip_malformed_duplicate_and_idless_entries():
+    from herdr4paseo.core import parse_agents, parse_permissions
+
+    raw = json.dumps([1, None, {"id": ""}, {"id": "a1", "name": "x"}, {"id": "a1", "name": "dupe"}, "s"])
+    assert [(a.id, a.name) for a in parse_agents(raw)] == [("a1", "x")]
+    assert parse_permissions("[1, null, {\"agentId\": \"a\", \"id\": \"p\"}]", "a")[0].id == "p"
+
+
+def test_permit_batch_allow_is_reviewable_only_deny_is_everything():
+    from herdr4paseo.core import PERMIT_BATCH, PERMIT_LABEL_MAX, Permission, permit_batch
+
+    perms = [Permission(id=f"p{i}", agent_id="a", name="Bash", description="x" * (PERMIT_LABEL_MAX if i == 1 else 5)) for i in range(9)]
+    allow = permit_batch(perms, "allow")
+    assert [p.id for p in allow] == ["p0", "p2", "p3", "p4"][:PERMIT_BATCH] and all(len(p.label) <= PERMIT_LABEL_MAX for p in allow)
+    assert len(permit_batch(perms, "deny")) == 9
+
+
+def test_every_record_field_is_size_capped_and_ascii_command_names_only():
+    from herdr4paseo.core import STORE_TEXT_LIMIT, apply_timeline_item, parse_commands, sanitize_text
+
+    timeline = []
+    for item in ({"type": "assistant_message", "text": "a" * 9_000_000}, {"type": "user_message", "text": "u" * 9_000_000},
+                 {"type": "error", "message": "e" * 9_000_000}, {"type": "tool_call", "callId": "c", "extra": {"k": "v" * 9_000_000}}):
+        apply_timeline_item(timeline, item, None)
+    assert all(len(v) <= STORE_TEXT_LIMIT + 10 for i in timeline for v in i.values() if isinstance(v, str))
+    assert [c.name for c in parse_commands([{"name": "he\u1160lp"}, {"name": "he\uffa0lp"}, {"name": "ok-1.x"}])] == ["ok-1.x"]
+    for ch in "\u206a\ufff9\u1160\uffa0\ufe00\U000e0100\u17b5":
+        assert sanitize_text(f"a{ch}b") == "a\ufffdb", hex(ord(ch))
+    assert sanitize_text("a\u200d\ufe0fb") == "a\u200d\ufe0fb"
+
+
+def test_parse_timeline_rejects_deep_nesting_and_non_objects_explicitly():
+    from herdr4paseo.core import MAX_RECORD_DEPTH, parse_timeline
+
+    ok = {"type": "tool_call", "detail": {"a": [{"b": [1]}]}}
+    assert parse_timeline(json.dumps(ok)) == [ok]
+    deep = json.dumps({"type": "x", "d": json.loads("[" * (MAX_RECORD_DEPTH + 5) + "]" * (MAX_RECORD_DEPTH + 5))})
+    with pytest.raises(ValueError, match="nested too deeply"):
+        parse_timeline(deep)
+    for raw in ("[]", "[1, 2]", '"s"', "7", "null"):
+        with pytest.raises(ValueError, match="not an object"):
+            parse_timeline(raw)
+    with pytest.raises(ValueError):  # a list nested far past any recursion limit: ValueError or RecursionError, never a crash
+        try:
+            parse_timeline("[" * 100_000 + "]" * 100_000)
+        except RecursionError as exc:
+            raise ValueError("recursion") from exc

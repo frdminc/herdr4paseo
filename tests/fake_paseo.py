@@ -7,7 +7,7 @@ import sys
 import time
 
 AGENTS = [
-    {"id": "aaaaaaa1-0000-0000-0000-000000000001", "shortId": "aaaaaaa", "name": "alpha",
+    {"id": "aaaaaaa1-0000-0000-0000-000000000001", "shortId": "aaaaaaa", "name": os.environ.get("FAKE_PASEO_NAME", "alpha"),
      "provider": "claude/x", "status": os.environ.get("FAKE_PASEO_STATUS", "running"), "cwd": "~/src/a", "created": "1 days ago"},
     {"id": "bbbbbbb2-0000-0000-0000-000000000002", "shortId": "bbbbbbb", "name": "beta",
      "provider": "codex/y", "status": "idle", "cwd": "~/src/b", "created": "2 days ago"},
@@ -20,7 +20,65 @@ cmd = sys.argv[1]
 if cmd == "ls":
     print(json.dumps(AGENTS))
 elif cmd == "logs":
+    if "--json" in sys.argv:
+        # Follow-mode records are deltas: three fragments with one messageId concatenate.
+        mode = os.environ.get("FAKE_PASEO_JSON_MODE", "")
+        items = [
+            {"type": "user_message", "text": "hello chat"},
+            {"type": "assistant_message", "text": "Hel", "messageId": "m1"},
+            {"type": "assistant_message", "text": "lo ", "messageId": "m1"},
+            {"type": "assistant_message", "text": "**world**", "messageId": "m1"},
+            {"type": "tool_call", "callId": "c1", "name": "Shell", "status": "completed", "detail": {"output": "done"}},
+        ]
+        if mode == "big":  # one record far over asyncio's 64 KiB StreamReader limit, then a normal one
+            items = [
+                {"type": "tool_call", "callId": "big", "name": "Shell", "status": "completed", "detail": {"output": "x" * 300_000}},
+                {"type": "assistant_message", "text": "after the big record", "messageId": "m2"},
+            ]
+        if mode == "escape":  # untrusted text carrying terminal control sequences
+            items = [{"type": "assistant_message", "text": "hi \x1b]52;c;cHduZWQ=\x1b\\ \x1b[2J \x1b]0;pwned\x07 \x9b31m done", "messageId": "e1"},
+                     {"type": "tool_call", "callId": "e2", "name": "Sh\x1b]8;;http://x\x1b\\ell", "status": "ok\x1b[31m"}]
+        if mode == "many":  # 300 one-character deltas, written back to back
+            items = [{"type": "assistant_message", "text": "ab"[i % 2], "messageId": "mm"} for i in range(300)]
+        if mode == "stderrbig":  # a stderr line over asyncio's 64 KiB limit
+            sys.stderr.write("e" * 200_000 + "\n")
+            sys.stderr.flush()
+        if mode == "deep":  # a record nested far past Python's recursion limit, then a normal one
+            depth = int(os.environ.get("FAKE_PASEO_DEPTH", "100000"))
+            deep = "[" * depth + "]" * depth
+            items = []
+            if "-f" in sys.argv:
+                print(deep, flush=True)
+            items = [{"type": "assistant_message", "text": "after the deep record", "messageId": "d1"}]
+        if mode == "bigtools":  # more rendered text than one redraw's budget
+            items = [{"type": "tool_call", "callId": f"t{i}", "name": "Shell", "status": "ok", "detail": {"out": "z" * 200_000}} for i in range(12)]
+        if mode == "badtype":  # a wrong-typed field must be skipped, not kill the app
+            items = [
+                {"type": "reasoning", "text": "a"},
+                {"type": "reasoning", "text": 1},
+                {"type": "assistant_message", "text": "still alive", "messageId": "m3"},
+            ]
+        if "-f" in sys.argv:
+            for item in items:
+                print(json.dumps(item), flush=True)
+            time.sleep(30)
+        else:
+            print(json.dumps({"agentId": sys.argv[2], "items": items}, indent=2))
+        sys.exit(0)
     tools_only = "--filter" in sys.argv
+    log_mode = os.environ.get("FAKE_PASEO_LOG_MODE", "")
+    if log_mode == "longline":  # one line over asyncio's 64 KiB StreamReader limit, then a normal one
+        print("[Shell] " + "x" * 200_000)
+        print("after the long line")
+        sys.stdout.flush()
+        time.sleep(30)
+        sys.exit(0)
+    if log_mode == "escape":
+        print("[User] hello \x1b]52;c;cHduZWQ=\x1b\\ \x1b[2J \x1b]0;pwned\x07 \x9b31m end")
+        print("plain assistant line")
+        sys.stdout.flush()
+        time.sleep(30)
+        sys.exit(0)
     print("[Shell] ls" if tools_only else "[User] hello there")
     if not tools_only:
         print("plain assistant line")

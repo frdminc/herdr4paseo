@@ -123,3 +123,19 @@ The tests drive the app with a fake `paseo` executable (`tests/fake_paseo.py`, s
 ## License
 
 MIT
+
+
+## Chat and log views
+
+Ctrl+V toggles the default line log and the opt-in structured chat. The header
+shows the active view. Ctrl+O filters either view to tools; prompt sending,
+permissions and slash commands keep their existing bindings.
+
+Chat follows `paseo logs <id> --json --tail N -f` as NDJSON, through `PASEO_BIN`.
+The parser also accepts the one-shot `paseo logs <id> --json --tail N` envelope.
+Assistant messages share the log's markdown styling and semantic THEME tokens.
+Message IDs and tool call IDs replace earlier snapshots; contiguous growing
+assistant messages without IDs replace the last assistant snapshot. The chat
+buffer redraws after updates, so partial fragments do not become separate rows.
+Switching views restarts the selected CLI stream and replays its tail. Stderr
+notices remain in the line log. No additional WebSocket request is used.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import os
 from collections.abc import Callable
 
@@ -16,6 +17,7 @@ from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.content import Content
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -38,6 +40,20 @@ from .core import (
     history_path,
     load_history,
     logs_argv,
+    MAX_LOG_LINE_BYTES,
+    MAX_RECORD_BYTES,
+    MAX_TIMELINE_ITEMS,
+    PERMIT_BATCH,
+    clip_label,
+    permit_batch,
+    sanitize_line,
+    sanitize_text,
+    trim_timeline,
+    apply_timeline_item,
+    iter_record_lines,
+    timeline_argv,
+    parse_timeline,
+    render_timeline_item,
     ls_argv,
     match_commands,
     parse_agents,
@@ -55,6 +71,9 @@ from .core import (
 from .daemon import DaemonError, fetch_commands
 
 STATUS_POLL_SECONDS = 3.0
+MAX_LOG_LINES = 20_000  # per RichLog: older lines scroll off instead of growing memory forever
+RENDER_BUDGET_CHARS = 512_000  # newest items rendered per chat redraw; older ones show as a count
+RENDER_SECONDS = 0.1  # at most ~10 chat re-renders a second however fast records arrive
 RECONNECT_SECONDS = 3.0
 
 
@@ -132,7 +151,7 @@ class NewAgent(ModalScreen[tuple[str, str, str]]):
 
     def __init__(self, provider: str) -> None:
         super().__init__()
-        self._provider = provider
+        self._provider = sanitize_line(provider)  # prefilled from `paseo ls`, so untrusted
 
     def compose(self) -> ComposeResult:
         with Vertical(id="new-box"):
@@ -168,7 +187,7 @@ class ConfirmStop(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         yield Static(
-            f"STOP agent {self._agent.name} ({self._agent.short_id}, {self._agent.status})?\n\n[y] yes   [n] no",
+            clip_label(sanitize_line(f"STOP agent {self._agent.name} ({self._agent.short_id}, {self._agent.status})?"), 200) + "\n\n[y] yes   [n] no",
             id="confirm-box",
             markup=False,
         )
@@ -185,15 +204,23 @@ class ConfirmPermits(ModalScreen[bool]):
         Binding("n,escape", "confirm(False)", "No"),
     ]
 
-    def __init__(self, decision: str, permits: list[Permission]) -> None:
+    def __init__(self, decision: str, permits: list[Permission], pending: int | None = None) -> None:
         super().__init__()
         self._decision = decision
         self._permits = permits
+        self._pending = len(permits) if pending is None else pending
 
     def compose(self) -> ComposeResult:
-        lines = "\n".join(f"  - {p.label}" for p in self._permits)
+        # Allow: every request listed here is shown in full and is exactly what y answers (permit_batch).
+        # Deny may answer more than it lists (denying an unread request is safe), so it says so.
+        shown = self._permits if self._decision == "allow" else self._permits[:PERMIT_BATCH]
+        lines = "\n".join(f"  - {p.label if self._decision == 'allow' else clip_label(p.label)}" for p in shown)
+        if self._decision == "allow" and self._pending > len(self._permits):
+            lines += f"\n  {self._pending - len(self._permits)} other request(s) stay pending (not shown here; Ctrl+A again for the next)"
+        elif len(self._permits) > len(shown):
+            lines += f"\n  ... and {len(self._permits) - len(shown)} more (all {len(self._permits)} are denied)"
         yield Static(
-            f"{self._decision.upper()} {len(self._permits)} pending request(s)?\n\n{lines}\n\n[y] yes   [n] no",
+            f"{self._decision.upper()} {len(self._permits)} of {self._pending} pending request(s)?\n\n{lines}\n\n[y] yes   [n] no",
             id="confirm-box",
             markup=False,
         )
@@ -245,6 +272,8 @@ QUIT_COMMANDS = frozenset({"/quit", "/exit"})
 class Herdr4PaseoApp(App[None]):
     CSS = """
     #log { height: 1fr; scrollbar-size-vertical: 1; scrollbar-color: #363646; scrollbar-color-hover: #54546D; scrollbar-color-active: #54546D; scrollbar-background: ansi_default; scrollbar-background-hover: ansi_default; scrollbar-background-active: ansi_default; }
+    #chat { height: 1fr; }
+    #chat.hidden, #log.hidden { display: none; }
     #prompt { height: 6; border: round $primary; }
     #permits { height: auto; color: $warning; text-style: bold; padding: 0 1; border-left: thick $warning; }
     #permits.hidden { display: none; }
@@ -259,6 +288,7 @@ class Herdr4PaseoApp(App[None]):
     ENABLE_COMMAND_PALETTE = False  # Ctrl+P is prompt history here
     BINDINGS = [
         Binding("ctrl+t", "toggle_behavior", "steer/interrupt"),
+        Binding("ctrl+v", "toggle_view", "log/chat", priority=True),
         Binding("ctrl+o", "toggle_tools", "tools only"),
         # Ctrl+G is macOS's Gemini shortcut, so the agent picker lives on Ctrl+L.
         Binding("ctrl+l", "switch_agent", "agents"),
@@ -280,6 +310,11 @@ class Herdr4PaseoApp(App[None]):
         self._tail = tail
         self.behavior = behavior
         self.tools_only = False
+        self.chat_view = False
+        self.timeline: list[dict] = []
+        self._rendered: dict[int, tuple[dict, Text]] = {}  # render cache by timeline index
+        self._render_timer = None  # pending coalesced render
+        self._open_chain: int | None = None  # index of the assistant/reasoning text still receiving deltas
         self.agent: Agent | None = None
         self._history: list[str] = load_history(history_path())
         self._last_status: str | None = None
@@ -292,7 +327,8 @@ class Herdr4PaseoApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical():
-            yield RichLog(id="log", wrap=True, markup=False, highlight=False, auto_scroll=True)
+            yield RichLog(id="log", wrap=True, markup=False, highlight=False, auto_scroll=True, max_lines=MAX_LOG_LINES)
+            yield RichLog(id="chat", classes="hidden", wrap=True, markup=False, highlight=False, max_lines=MAX_LOG_LINES)
             yield Static("", id="permits", classes="hidden", markup=False)
             yield Static("", id="slash", classes="hidden", markup=False)
             yield PromptArea(id="prompt")
@@ -321,7 +357,7 @@ class Herdr4PaseoApp(App[None]):
             return []
         try:
             return parse_agents(out)
-        except ValueError as exc:
+        except (ValueError, TypeError, AttributeError) as exc:
             self._note(f"could not read agent list: {exc}", "error.text")
             return []
 
@@ -337,7 +373,7 @@ class Herdr4PaseoApp(App[None]):
             return
         self.agent = picked
         self._last_status = picked.status
-        self.title = f"{picked.name} ({picked.short_id})"
+        self.title = sanitize_line(f"{picked.name} ({picked.short_id})")
         self._update_subtitle(picked.status)
         self._start_stream()
         self._load_commands(picked.id)
@@ -367,12 +403,14 @@ class Herdr4PaseoApp(App[None]):
             return  # keep the last banner; a transient failure must not hide a pending request
         try:
             self.permits = parse_permissions(out, self.agent.id)
-        except ValueError:
+        except (ValueError, TypeError, AttributeError):
             return
         self.refresh_bindings()
         banner = self.query_one("#permits", Static)
         if self.permits:
-            names = "; ".join(p.label for p in self.permits)
+            names = "; ".join(clip_label(p.label, 80) for p in self.permits[:3])
+            if len(self.permits) > 3:
+                names += f"; ... and {len(self.permits) - 3} more"
             banner.update(f"{len(self.permits)} pending: {names}  (Ctrl+A allow, Ctrl+D deny)")
             banner.remove_class("hidden")
         else:
@@ -393,13 +431,14 @@ class Herdr4PaseoApp(App[None]):
 
     def _update_subtitle(self, status: str) -> None:
         view = "tools only" if self.tools_only else "full log"
-        self.sub_title = f"{status} | send: {self.behavior} | {view}"
+        status = sanitize_line(status)
+        self.sub_title = f"{status} | send: {self.behavior} | {'chat' if self.chat_view else 'log'} | {view}"
 
     # -- log stream -----------------------------------------------------------------
 
     def _note(self, message: str, token: str) -> None:
         """Write one of herdr4paseo's own lines to the log, styled by a core.THEME token."""
-        self.query_one("#log", RichLog).write(Text(message, style=style_for(token)))
+        self.query_one("#log", RichLog).write(Text(sanitize_text(message), style=style_for(token)))
 
     @work(exclusive=True, group="stream")
     async def _start_stream(self) -> None:
@@ -408,18 +447,30 @@ class Herdr4PaseoApp(App[None]):
             return
         log = self.query_one("#log", RichLog)
         agent_id, tools_only = self.agent.id, self.tools_only
+        if self.chat_view:
+            self._start_chat_stream()
+            return
+        self.workers.cancel_group(self, "chat-stream")
         while True:
             log.clear()
             styler = LogStyler()  # fresh state for each (re)attach: the tail is replayed from scratch
-            proc = await asyncio.create_subprocess_exec(
-                *logs_argv(agent_id, tail=self._tail, tools_only=tools_only),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *logs_argv(agent_id, tail=self._tail, tools_only=tools_only),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            except OSError as exc:  # paseo missing or not executable: note it and retry, never exit
+                self._note(f"cannot run paseo: {exc.strerror or exc}; retrying in {RECONNECT_SECONDS:g}s", "error.text")
+                await asyncio.sleep(RECONNECT_SECONDS)
+                continue
             try:
                 assert proc.stdout is not None
-                while line := await proc.stdout.readline():
+                async for line in iter_record_lines(proc.stdout, MAX_LOG_LINE_BYTES):
+                    if line is None:  # no 64 KiB readline() limit: a huge line is skipped with a notice
+                        self._note(f"skipped a log line over {MAX_LOG_LINE_BYTES >> 10} KiB", "error.text")
+                        continue
                     log.write(styler.style(line.decode(errors="replace").rstrip("\n")))
                 rc = await proc.wait()
             finally:
@@ -428,6 +479,108 @@ class Herdr4PaseoApp(App[None]):
                         proc.terminate()
                     await proc.wait()
             self._note(f"log stream ended (rc={rc}); reconnecting in {RECONNECT_SECONDS:g}s", "meta")
+            await asyncio.sleep(RECONNECT_SECONDS)
+
+    def _apply_timeline(self, raw: str) -> None:
+        """Fold records into the timeline now; the visible re-render is coalesced (RENDER_SECONDS)."""
+        # an envelope can hold thousands of items: only the newest ones can survive the trim anyway
+        for item in parse_timeline(raw)[-MAX_TIMELINE_ITEMS:]:
+            self._open_chain = apply_timeline_item(self.timeline, item, self._open_chain)
+        self._open_chain, dropped = trim_timeline(self.timeline, self._open_chain)
+        if dropped:
+            self._rendered = {}
+        if self._render_timer is None:
+            self._render_timer = self.set_timer(RENDER_SECONDS, self._render_timeline)
+
+    def _render_timeline(self) -> None:
+        """Redraw the newest items that fit RENDER_BUDGET_CHARS; unchanged items reuse their cached Text."""
+        self._render_timer = None
+        try:
+            log = self.query_one("#chat", RichLog)
+        except NoMatches:  # the timer fired while the app was shutting down
+            return
+        try:
+            self._redraw_chat(log)
+        except Exception as exc:  # a render bug must not take the app (and its permit banner) down
+            self._note(f"chat render failed: {type(exc).__name__}", "error.text")
+
+    def _redraw_chat(self, log: RichLog) -> None:
+        cache, budget, shown = self._rendered, RENDER_BUDGET_CHARS, []
+        hidden = 0
+        for i in range(len(self.timeline) - 1, -1, -1):
+            item = self.timeline[i]
+            if self.tools_only and item["type"] != "tool_call":
+                continue
+            if budget <= 0:
+                hidden += 1
+                continue
+            # apply_timeline_item swaps in a new dict for every change, so `is` finds the unchanged items
+            if i in cache and cache[i][0] is item:
+                text = cache[i][1]
+            else:
+                try:
+                    text = render_timeline_item(item)
+                except Exception:
+                    text = Text("[unrenderable record]", style=style_for("error.text"))
+                cache[i] = (item, text)
+            budget -= len(text.plain)
+            shown.append(text)
+        log.clear()
+        if hidden:
+            log.write(Text(f"... {hidden} earlier items not shown", style=style_for("meta")))
+        for text in reversed(shown):
+            log.write(text)
+            log.write("")
+
+    def _reset_timeline(self) -> None:
+        self.timeline, self._rendered, self._open_chain = [], {}, None
+        if self._render_timer is not None:
+            self._render_timer.stop()
+            self._render_timer = None
+        with contextlib.suppress(NoMatches):
+            self.query_one("#chat", RichLog).clear()
+
+    @work(exclusive=True, group="chat-stream")
+    async def _start_chat_stream(self) -> None:
+        if self.agent is None:
+            return
+        agent_id = self.agent.id
+        while True:
+            self._reset_timeline()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *timeline_argv(agent_id, tail=self._tail),
+                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as exc:
+                self._note(f"cannot run paseo: {exc.strerror or exc}; retrying in {RECONNECT_SECONDS:g}s", "error.text")
+                await asyncio.sleep(RECONNECT_SECONDS)
+                continue
+            async def notices() -> None:
+                assert proc.stderr is not None
+                async for line in iter_record_lines(proc.stderr, MAX_LOG_LINE_BYTES):
+                    self._note("skipped a stderr line over %d KiB" % (MAX_LOG_LINE_BYTES >> 10) if line is None
+                               else line.decode(errors="replace").rstrip(), "meta")
+            reader = asyncio.create_task(notices())
+            try:
+                assert proc.stdout is not None
+                async for line in iter_record_lines(proc.stdout, MAX_RECORD_BYTES):
+                    if line is None:
+                        self._note(f"skipped a timeline record over {MAX_RECORD_BYTES >> 10} KiB", "error.text")
+                        continue
+                    try:
+                        self._apply_timeline(line.decode(errors="replace"))
+                    except (ValueError, TypeError, AttributeError, KeyError, RecursionError):  # malformed record: skip it, keep the stream
+                        self._note("invalid timeline JSON record", "error.text")
+                await proc.wait()
+            finally:
+                if proc.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.terminate()
+                    await proc.wait()
+                await reader
+            self._note("chat stream ended; reconnecting", "meta")
             await asyncio.sleep(RECONNECT_SECONDS)
 
     # -- slash commands -------------------------------------------------------------
@@ -506,6 +659,13 @@ class Herdr4PaseoApp(App[None]):
         self.behavior = BEHAVIORS[(BEHAVIORS.index(self.behavior) + 1) % len(BEHAVIORS)]
         self._update_subtitle(self.sub_title.split(" | ")[0])
 
+    def action_toggle_view(self) -> None:
+        self.chat_view = not self.chat_view
+        self.query_one("#log").set_class(self.chat_view, "hidden")
+        self.query_one("#chat").set_class(not self.chat_view, "hidden")
+        self._update_subtitle(self.sub_title.split(" | ")[0])
+        self._start_stream()
+
     def action_toggle_tools(self) -> None:
         self.tools_only = not self.tools_only
         self._update_subtitle(self.sub_title.split(" | ")[0])
@@ -519,11 +679,15 @@ class Herdr4PaseoApp(App[None]):
         if self.agent is None:
             return
         await self._refresh_permits()
-        shown = list(self.permits)  # answer exactly what the confirmation lists
-        if not shown:
+        pending = list(self.permits)
+        shown = permit_batch(pending, decision)  # answer exactly what the confirmation lists in full
+        if not pending:
             self._note("no pending permission requests", "meta")
             return
-        if not await self.push_screen_wait(ConfirmPermits(decision, shown)):
+        if not shown:
+            self._note("pending request(s) too long to review here; answer them with `paseo permit allow` after reading them", "error.text")
+            return
+        if not await self.push_screen_wait(ConfirmPermits(decision, shown, len(pending))):
             return
         for permit in shown:
             code, _out, err = await run_paseo(permit_argv(decision, self.agent.id, permit.id))

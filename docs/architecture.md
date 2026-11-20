@@ -66,3 +66,19 @@ uv run --group dev pytest -q
 The suite drives the real app through Textual's pilot against the fake executable and the fake daemon, so it never touches a real daemon or sends to a live agent. Tests set `PASEO_HOME` to a temporary directory and `PASEO_HOST` to a refused port so an accidental real connection is impossible.
 
 Two things are only checked against the real daemon by hand: the exact output formats of `paseo logs` and `paseo ls --json` (read on 2026-10-28), and `paseo permit allow|deny` on a real pending request, which has not been exercised live yet.
+
+
+## Chat and log views
+
+Ctrl+V toggles the default line log and the opt-in structured chat. The header
+shows the active view. Ctrl+O filters either view to tools; prompt sending,
+permissions and slash commands keep their existing bindings.
+
+Chat follows `paseo logs <id> --json --tail N -f` as NDJSON, through `PASEO_BIN`.
+The parser also accepts the one-shot `paseo logs <id> --json --tail N` envelope.
+Assistant messages share the log's markdown styling and semantic THEME tokens.
+Message IDs and tool call IDs replace earlier snapshots; contiguous growing
+assistant messages without IDs replace the last assistant snapshot. The chat
+buffer redraws after updates, so partial fragments do not become separate rows.
+Switching views restarts the selected CLI stream and replays its tail. Stderr
+notices remain in the line log. No additional WebSocket request is used.
