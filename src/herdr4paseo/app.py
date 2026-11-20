@@ -42,6 +42,8 @@ from .core import (
     logs_argv,
     MAX_LOG_LINE_BYTES,
     MAX_RECORD_BYTES,
+    MAX_TIMELINE_ITEMS,
+    clip_label,
     sanitize_line,
     sanitize_text,
     trim_timeline,
@@ -147,7 +149,7 @@ class NewAgent(ModalScreen[tuple[str, str, str]]):
 
     def __init__(self, provider: str) -> None:
         super().__init__()
-        self._provider = provider
+        self._provider = sanitize_line(provider)  # prefilled from `paseo ls`, so untrusted
 
     def compose(self) -> ComposeResult:
         with Vertical(id="new-box"):
@@ -183,7 +185,7 @@ class ConfirmStop(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         yield Static(
-            sanitize_text(f"STOP agent {self._agent.name} ({self._agent.short_id}, {self._agent.status})?") + "\n\n[y] yes   [n] no",
+            clip_label(sanitize_line(f"STOP agent {self._agent.name} ({self._agent.short_id}, {self._agent.status})?"), 200) + "\n\n[y] yes   [n] no",
             id="confirm-box",
             markup=False,
         )
@@ -206,7 +208,10 @@ class ConfirmPermits(ModalScreen[bool]):
         self._permits = permits
 
     def compose(self) -> ComposeResult:
-        lines = "\n".join(f"  - {p.label}" for p in self._permits)
+        # one clipped line per request, at most 8 shown, so the count and the [y]/[n] line stay on screen
+        lines = "\n".join(f"  - {clip_label(p.label)}" for p in self._permits[:8])
+        if len(self._permits) > 8:
+            lines += f"\n  ... and {len(self._permits) - 8} more (all {len(self._permits)} are answered)"
         yield Static(
             f"{self._decision.upper()} {len(self._permits)} pending request(s)?\n\n{lines}\n\n[y] yes   [n] no",
             id="confirm-box",
@@ -345,7 +350,7 @@ class Herdr4PaseoApp(App[None]):
             return []
         try:
             return parse_agents(out)
-        except ValueError as exc:
+        except (ValueError, TypeError, AttributeError) as exc:
             self._note(f"could not read agent list: {exc}", "error.text")
             return []
 
@@ -391,12 +396,14 @@ class Herdr4PaseoApp(App[None]):
             return  # keep the last banner; a transient failure must not hide a pending request
         try:
             self.permits = parse_permissions(out, self.agent.id)
-        except ValueError:
+        except (ValueError, TypeError, AttributeError):
             return
         self.refresh_bindings()
         banner = self.query_one("#permits", Static)
         if self.permits:
-            names = "; ".join(p.label for p in self.permits)
+            names = "; ".join(clip_label(p.label, 80) for p in self.permits[:3])
+            if len(self.permits) > 3:
+                names += f"; ... and {len(self.permits) - 3} more"
             banner.update(f"{len(self.permits)} pending: {names}  (Ctrl+A allow, Ctrl+D deny)")
             banner.remove_class("hidden")
         else:
@@ -440,12 +447,17 @@ class Herdr4PaseoApp(App[None]):
         while True:
             log.clear()
             styler = LogStyler()  # fresh state for each (re)attach: the tail is replayed from scratch
-            proc = await asyncio.create_subprocess_exec(
-                *logs_argv(agent_id, tail=self._tail, tools_only=tools_only),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *logs_argv(agent_id, tail=self._tail, tools_only=tools_only),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            except OSError as exc:  # paseo missing or not executable: note it and retry, never exit
+                self._note(f"cannot run paseo: {exc.strerror or exc}; retrying in {RECONNECT_SECONDS:g}s", "error.text")
+                await asyncio.sleep(RECONNECT_SECONDS)
+                continue
             try:
                 assert proc.stdout is not None
                 async for line in iter_record_lines(proc.stdout, MAX_LOG_LINE_BYTES):
@@ -464,7 +476,8 @@ class Herdr4PaseoApp(App[None]):
 
     def _apply_timeline(self, raw: str) -> None:
         """Fold records into the timeline now; the visible re-render is coalesced (RENDER_SECONDS)."""
-        for item in parse_timeline(raw):
+        # an envelope can hold thousands of items: only the newest ones can survive the trim anyway
+        for item in parse_timeline(raw)[-MAX_TIMELINE_ITEMS:]:
             self._open_chain = apply_timeline_item(self.timeline, item, self._open_chain)
         self._open_chain, dropped = trim_timeline(self.timeline, self._open_chain)
         if dropped:
@@ -527,11 +540,16 @@ class Herdr4PaseoApp(App[None]):
         agent_id = self.agent.id
         while True:
             self._reset_timeline()
-            proc = await asyncio.create_subprocess_exec(
-                *timeline_argv(agent_id, tail=self._tail),
-                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *timeline_argv(agent_id, tail=self._tail),
+                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as exc:
+                self._note(f"cannot run paseo: {exc.strerror or exc}; retrying in {RECONNECT_SECONDS:g}s", "error.text")
+                await asyncio.sleep(RECONNECT_SECONDS)
+                continue
             async def notices() -> None:
                 assert proc.stderr is not None
                 async for line in iter_record_lines(proc.stderr, MAX_LOG_LINE_BYTES):

@@ -82,14 +82,15 @@ async def fetch_commands(agent_id: str, *, timeout: float = 30.0) -> list[Comman
                 inner = message.get("message") if message.get("type") == "session" else None
                 if not isinstance(inner, dict) or inner.get("type") != "list_commands_response":
                     continue
-                payload = inner.get("payload") or {}
-                if payload.get("requestId") != request_id:
+                payload = inner.get("payload")
+                if not isinstance(payload, dict) or payload.get("requestId") != request_id:
                     continue
                 if payload.get("error"):
                     raise DaemonError(str(payload["error"]))
-                return parse_commands(payload.get("commands") or [])
+                commands = payload.get("commands")
+                return parse_commands(commands if isinstance(commands, list) else [])
     except DaemonError:
         raise
-    except (OSError, TimeoutError, ValueError, websockets.WebSocketException) as exc:
+    except (OSError, TimeoutError, ValueError, TypeError, AttributeError, websockets.WebSocketException) as exc:
         raise DaemonError(f"{type(exc).__name__}: {exc}") from exc
     raise DaemonError("daemon closed the connection before answering")

@@ -548,3 +548,56 @@ def test_link_highlighting_skips_pathologically_long_lines():
     assert len(line) > MAX_HIGHLIGHT_LINE
     assert LogStyler().style(line).spans == []
     assert LogStyler().style("see https://example.com/x").spans  # short lines still highlight
+
+
+# -- round 4: regex backtracking, caps, parsing guards ----------------------------------------------
+
+
+def test_link_regexes_do_not_backtrack_quadratically_inside_the_gate():
+    import time
+
+    from herdr4paseo.core import MAX_HIGHLIGHT_LINE, LogStyler, render_timeline_item
+
+    for unit in ("[", "[a](", "[a](b", "](", "`", "http://"):
+        line = (unit * MAX_HIGHLIGHT_LINE)[: MAX_HIGHLIGHT_LINE - 1]
+        start = time.perf_counter()
+        LogStyler().style(line)
+        assert time.perf_counter() - start < 0.2, unit
+    start = time.perf_counter()
+    render_timeline_item({"type": "assistant_message", "text": "\n".join("[" * 4_999 for _ in range(51))})
+    assert time.perf_counter() - start < 2
+
+
+def test_streamed_text_and_huge_tool_detail_are_capped_in_storage():
+    from herdr4paseo.core import MAX_DETAIL_CHARS, STORE_TEXT_LIMIT, apply_timeline_item
+
+    timeline, chain = [], None
+    for _ in range(40):
+        chain = apply_timeline_item(timeline, {"type": "assistant_message", "text": "x" * 100_000, "messageId": "m"}, chain)
+    assert len(timeline) == 1 and len(timeline[0]["text"]) == STORE_TEXT_LIMIT
+    apply_timeline_item(timeline, {"type": "tool_call", "callId": "c", "name": "S", "detail": {"o": "y" * 5_000_000}}, None)
+    assert len(timeline[1]["detail"]) < 5 * MAX_DETAIL_CHARS
+
+
+def test_trim_timeline_drops_several_batches_when_far_over():
+    from herdr4paseo.core import MAX_TIMELINE_ITEMS, TRIM_BATCH, trim_timeline
+
+    tl = [{"type": "user_message", "text": "x"}] * 5_000
+    chain, dropped = trim_timeline(tl, 4_999)
+    assert len(tl) <= MAX_TIMELINE_ITEMS + TRIM_BATCH and dropped % TRIM_BATCH == 0 and chain == len(tl) - 1
+
+
+def test_invisible_format_characters_and_tag_characters_are_neutralized():
+    from herdr4paseo.core import parse_commands, sanitize_text
+
+    for ch in "­͏ᅟ឴᠎⁡⁤ㅤ\U000e0041":
+        assert sanitize_text(f"a{ch}b") == "a�b", hex(ord(ch))
+    assert [c.name for c in parse_commands([{"name": "he­lp"}, {"name": "he\U000e0041lp"}, {"name": "git:commit-all.v2/x"}, {"name": "résumé"}])] == ["git:commit-all.v2/x", "résumé"]
+
+
+def test_listing_parsers_skip_malformed_duplicate_and_idless_entries():
+    from herdr4paseo.core import parse_agents, parse_permissions
+
+    raw = json.dumps([1, None, {"id": ""}, {"id": "a1", "name": "x"}, {"id": "a1", "name": "dupe"}, "s"])
+    assert [(a.id, a.name) for a in parse_agents(raw)] == [("a1", "x")]
+    assert parse_permissions("[1, null, {\"agentId\": \"a\", \"id\": \"p\"}]", "a")[0].id == "p"

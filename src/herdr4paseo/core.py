@@ -137,7 +137,11 @@ def parse_agents(raw: str) -> list[Agent]:
     if not isinstance(data, list):
         raise ValueError("expected a JSON array from `paseo ls --json`")
     agents = []
+    seen: set[str] = set()
     for item in data:
+        if not isinstance(item, dict) or not item.get("id") or str(item["id"]) in seen:
+            continue  # a malformed or duplicate entry must not take the picker (or the app) down
+        seen.add(str(item["id"]))
         agent_id = str(item.get("id", ""))
         agents.append(
             Agent(
@@ -231,7 +235,7 @@ def parse_permissions(raw: str, agent_id: str) -> list[Permission]:
             description=str(item.get("description", "")),
         )
         for item in data
-        if item.get("agentId") == agent_id
+        if isinstance(item, dict) and item.get("agentId") == agent_id
     ]
 
 
@@ -248,14 +252,21 @@ class Command:
         return sanitize_line(f"/{self.name}{hint}  {self.description}")
 
 
+_COMMAND_NAME = re.compile(r"[\w.:/-]+")
+
+
+def clip_label(label: str, limit: int = 160) -> str:
+    return label if len(label) <= limit else label[: limit - 1] + "\u2026"
+
+
 def parse_commands(items: list[object]) -> list[Command]:
     """Parse the `commands` array of a list_commands response; skip malformed entries."""
     commands = []
     for item in items:
         if not isinstance(item, dict) or not item.get("name"):
             continue
-        if _CONTROLS.search(str(item["name"])) or any(c.isspace() for c in str(item["name"])):
-            continue  # Tab completion would insert this name into the prompt
+        if not _COMMAND_NAME.fullmatch(str(item["name"])):
+            continue  # Tab completion would insert this name into the prompt: letters, digits and . _ : / - only
         commands.append(
             Command(
                 name=str(item["name"]),
@@ -334,7 +345,7 @@ _HEADING = re.compile(r"^ {0,3}#{1,6}(?:\s|$)")
 _BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])(?=\s)")
 _QUOTE = re.compile(r"^\s*>")
 _INLINE_CODE = re.compile(r"`[^`\n]+`")
-_LINK = re.compile(r"\[(?P<label>[^\]\n]+)\]\([^)\s]+\)")  # only the label is highlighted, not the [](url) syntax
+_LINK = re.compile(r"\[(?P<label>[^\[\]\n]+)\]\([^()\s]+\)")  # only the label is highlighted, not the [](url) syntax
 # A bare URL: only the host (the FQDN, without a leading "www." or a port) is highlighted.
 _BARE_URL = re.compile(r"https?://(?P<host>[^\s/:?#)\]>\"'<`,;]+)", re.IGNORECASE)
 _FENCE = re.compile(r"^\s*```\s*([\w+#.-]*)")
@@ -582,7 +593,7 @@ def parse_timeline(raw: str) -> list[dict]:
 
 # C0 (bar \n \t), DEL, C1, plus characters that reorder or hide text: bidi marks/embeddings/overrides/
 # isolates, zero-width space, word joiner, BOM, line/paragraph separators. ZWJ/ZWNJ stay (emoji, scripts).
-_CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060\u2066-\u2069\ufeff]")
+_CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060\u2066-\u2069\ufeff\u00ad\u034f\u115f\u17b4\u180e\u2061-\u2064\u3164\U000e0000-\U000e007f]")
 MAX_TEXT_CHARS = 256_000  # displayed per timeline item; the full text stays in memory
 MAX_DETAIL_CHARS = 64_000  # displayed tool-call detail
 
@@ -649,6 +660,20 @@ def render_timeline_item(item: dict) -> Text:
     return Text(f"[{_clean(kind, 100)}] " + _clean(rest, MAX_DETAIL_CHARS), style=style_for("meta"))
 
 
+STORE_TEXT_LIMIT = 2 * MAX_TEXT_CHARS  # stored per streamed message; the display shows MAX_TEXT_CHARS of it
+
+
+def _compact(item: dict) -> dict:
+    """Keep a huge tool detail from being stored whole (the display clips it to MAX_DETAIL_CHARS anyway)."""
+    detail = item.get("detail")
+    if detail is None or not isinstance(detail, (dict, list)):
+        return item
+    dumped = json.dumps(detail, ensure_ascii=False, default=str)
+    if len(dumped) <= 4 * MAX_DETAIL_CHARS:
+        return item
+    return {**item, "detail": dumped[: 4 * MAX_DETAIL_CHARS] + "..."}
+
+
 STREAMING_TEXT_TYPES = frozenset({"assistant_message", "reasoning"})
 
 
@@ -668,10 +693,13 @@ def apply_timeline_item(timeline: list[dict], item: dict, open_chain: int | None
             old = timeline[open_chain]
             same_message = kind != "assistant_message" or not item.get("messageId") or item.get("messageId") == old.get("messageId")
             if old["type"] == kind and same_message:
-                timeline[open_chain] = {**old, "text": old.get("text", "") + item.get("text", "")}
+                if len(old.get("text", "")) >= STORE_TEXT_LIMIT:
+                    return open_chain  # stored text is capped (the display clips earlier); stop growing it
+                timeline[open_chain] = {**old, "text": (old.get("text", "") + str(item.get("text", "")))[:STORE_TEXT_LIMIT]}
                 return open_chain
         timeline.append(dict(item))
         return len(timeline) - 1
+    item = _compact(item)
     call_id = item.get("callId")
     if kind == "tool_call" and call_id:
         for i, old in enumerate(timeline):
@@ -690,8 +718,9 @@ def trim_timeline(timeline: list[dict], open_chain: int | None) -> tuple[int | N
     """Drop the oldest TRIM_BATCH items once the timeline passes MAX_TIMELINE_ITEMS + TRIM_BATCH."""
     if len(timeline) <= MAX_TIMELINE_ITEMS + TRIM_BATCH:
         return open_chain, 0
-    del timeline[:TRIM_BATCH]
-    return (None if open_chain is None or open_chain < TRIM_BATCH else open_chain - TRIM_BATCH), TRIM_BATCH
+    drop = (len(timeline) - MAX_TIMELINE_ITEMS) // TRIM_BATCH * TRIM_BATCH
+    del timeline[:drop]
+    return (None if open_chain is None or open_chain < drop else open_chain - drop), drop
 
 
 MAX_RECORD_BYTES = 8 * 1024 * 1024  # one `paseo logs --json` record; larger ones are skipped, not buffered
