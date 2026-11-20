@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -252,7 +253,20 @@ class Command:
         return sanitize_line(f"/{self.name}{hint}  {self.description}")
 
 
-_COMMAND_NAME = re.compile(r"[\w.:/-]+")
+_COMMAND_NAME = re.compile(r"[A-Za-z0-9_.:/-]+", re.ASCII)
+
+
+PERMIT_BATCH = 4  # requests one allow-dialog shows in full (and answers)
+PERMIT_LABEL_MAX = 200
+
+
+def permit_batch(permits: list[Permission], decision: str) -> list[Permission]:
+    """The requests one confirmation answers. Allow answers only requests whose full text the dialog
+    can show (at most PERMIT_BATCH, each at most PERMIT_LABEL_MAX characters); the rest stay pending.
+    Deny answers every request: denying one you have not read is safe."""
+    if decision != "allow":
+        return list(permits)
+    return [p for p in permits if len(p.label) <= PERMIT_LABEL_MAX][:PERMIT_BATCH]
 
 
 def clip_label(label: str, limit: int = 160) -> str:
@@ -593,7 +607,20 @@ def parse_timeline(raw: str) -> list[dict]:
 
 # C0 (bar \n \t), DEL, C1, plus characters that reorder or hide text: bidi marks/embeddings/overrides/
 # isolates, zero-width space, word joiner, BOM, line/paragraph separators. ZWJ/ZWNJ stay (emoji, scripts).
-_CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060\u2066-\u2069\ufeff\u00ad\u034f\u115f\u17b4\u180e\u2061-\u2064\u3164\U000e0000-\U000e007f]")
+def _invisible_chars() -> str:
+    """Every Cf (format) character except ZWJ/ZWNJ, variation selectors other than the emoji/text
+    pair FE0E/FE0F, the Hangul fillers, plus the explicit bidi/separator/tag set. A category scan
+    instead of a hand-written list, which kept having gaps."""
+    keep = {"\u200c", "\u200d"}
+    chars = {chr(c) for c in range(0x10000) if unicodedata.category(chr(c)) == "Cf"} - keep
+    for lo, hi in ((0xFE00, 0xFE0D), (0x180B, 0x180D), (0xE0100, 0xE01EF), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+                   (0x13430, 0x1343F), (0xE0000, 0xE007F), (0x2028, 0x2029)):
+        chars |= {chr(c) for c in range(lo, hi + 1)}
+    chars |= set("\u115f\u1160\u3164\uffa0\u17b4\u17b5\u180e\u180f\u034f\u00ad")
+    return "".join(re.escape(c) for c in sorted(chars))
+
+
+_CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f" + _invisible_chars() + "]")
 MAX_TEXT_CHARS = 256_000  # displayed per timeline item; the full text stays in memory
 MAX_DETAIL_CHARS = 64_000  # displayed tool-call detail
 
@@ -664,14 +691,21 @@ STORE_TEXT_LIMIT = 2 * MAX_TEXT_CHARS  # stored per streamed message; the displa
 
 
 def _compact(item: dict) -> dict:
-    """Keep a huge tool detail from being stored whole (the display clips it to MAX_DETAIL_CHARS anyway)."""
-    detail = item.get("detail")
-    if detail is None or not isinstance(detail, (dict, list)):
-        return item
-    dumped = json.dumps(detail, ensure_ascii=False, default=str)
-    if len(dumped) <= 4 * MAX_DETAIL_CHARS:
-        return item
-    return {**item, "detail": dumped[: 4 * MAX_DETAIL_CHARS] + "..."}
+    """One size gate for every stored record: long strings are clipped to STORE_TEXT_LIMIT and any
+    nested value whose dump passes 4*MAX_DETAIL_CHARS becomes its clipped dump (the display clips
+    far below both)."""
+    out = None
+    for key, value in item.items():
+        if isinstance(value, str):
+            if len(value) > STORE_TEXT_LIMIT:
+                out = out or dict(item)
+                out[key] = value[:STORE_TEXT_LIMIT]
+        elif isinstance(value, (dict, list)):
+            dumped = json.dumps(value, ensure_ascii=False, default=str)
+            if len(dumped) > 4 * MAX_DETAIL_CHARS:
+                out = out or dict(item)
+                out[key] = dumped[: 4 * MAX_DETAIL_CHARS] + "..."
+    return out or item
 
 
 STREAMING_TEXT_TYPES = frozenset({"assistant_message", "reasoning"})
@@ -697,7 +731,7 @@ def apply_timeline_item(timeline: list[dict], item: dict, open_chain: int | None
                     return open_chain  # stored text is capped (the display clips earlier); stop growing it
                 timeline[open_chain] = {**old, "text": (old.get("text", "") + str(item.get("text", "")))[:STORE_TEXT_LIMIT]}
                 return open_chain
-        timeline.append(dict(item))
+        timeline.append(dict(_compact(item)))
         return len(timeline) - 1
     item = _compact(item)
     call_id = item.get("callId")

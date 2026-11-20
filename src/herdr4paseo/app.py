@@ -43,7 +43,9 @@ from .core import (
     MAX_LOG_LINE_BYTES,
     MAX_RECORD_BYTES,
     MAX_TIMELINE_ITEMS,
+    PERMIT_BATCH,
     clip_label,
+    permit_batch,
     sanitize_line,
     sanitize_text,
     trim_timeline,
@@ -202,18 +204,23 @@ class ConfirmPermits(ModalScreen[bool]):
         Binding("n,escape", "confirm(False)", "No"),
     ]
 
-    def __init__(self, decision: str, permits: list[Permission]) -> None:
+    def __init__(self, decision: str, permits: list[Permission], pending: int | None = None) -> None:
         super().__init__()
         self._decision = decision
         self._permits = permits
+        self._pending = len(permits) if pending is None else pending
 
     def compose(self) -> ComposeResult:
-        # one clipped line per request, at most 8 shown, so the count and the [y]/[n] line stay on screen
-        lines = "\n".join(f"  - {clip_label(p.label)}" for p in self._permits[:8])
-        if len(self._permits) > 8:
-            lines += f"\n  ... and {len(self._permits) - 8} more (all {len(self._permits)} are answered)"
+        # Allow: every request listed here is shown in full and is exactly what y answers (permit_batch).
+        # Deny may answer more than it lists (denying an unread request is safe), so it says so.
+        shown = self._permits if self._decision == "allow" else self._permits[:PERMIT_BATCH]
+        lines = "\n".join(f"  - {p.label if self._decision == 'allow' else clip_label(p.label)}" for p in shown)
+        if self._decision == "allow" and self._pending > len(self._permits):
+            lines += f"\n  {self._pending - len(self._permits)} other request(s) stay pending (not shown here; Ctrl+A again for the next)"
+        elif len(self._permits) > len(shown):
+            lines += f"\n  ... and {len(self._permits) - len(shown)} more (all {len(self._permits)} are denied)"
         yield Static(
-            f"{self._decision.upper()} {len(self._permits)} pending request(s)?\n\n{lines}\n\n[y] yes   [n] no",
+            f"{self._decision.upper()} {len(self._permits)} of {self._pending} pending request(s)?\n\n{lines}\n\n[y] yes   [n] no",
             id="confirm-box",
             markup=False,
         )
@@ -672,11 +679,15 @@ class Herdr4PaseoApp(App[None]):
         if self.agent is None:
             return
         await self._refresh_permits()
-        shown = list(self.permits)  # answer exactly what the confirmation lists
-        if not shown:
+        pending = list(self.permits)
+        shown = permit_batch(pending, decision)  # answer exactly what the confirmation lists in full
+        if not pending:
             self._note("no pending permission requests", "meta")
             return
-        if not await self.push_screen_wait(ConfirmPermits(decision, shown)):
+        if not shown:
+            self._note("pending request(s) too long to review here; answer them with `paseo permit allow` after reading them", "error.text")
+            return
+        if not await self.push_screen_wait(ConfirmPermits(decision, shown, len(pending))):
             return
         for permit in shown:
             code, _out, err = await run_paseo(permit_argv(decision, self.agent.id, permit.id))

@@ -592,7 +592,7 @@ def test_invisible_format_characters_and_tag_characters_are_neutralized():
 
     for ch in "­͏ᅟ឴᠎⁡⁤ㅤ\U000e0041":
         assert sanitize_text(f"a{ch}b") == "a�b", hex(ord(ch))
-    assert [c.name for c in parse_commands([{"name": "he­lp"}, {"name": "he\U000e0041lp"}, {"name": "git:commit-all.v2/x"}, {"name": "résumé"}])] == ["git:commit-all.v2/x", "résumé"]
+    assert [c.name for c in parse_commands([{"name": "he­lp"}, {"name": "he\U000e0041lp"}, {"name": "git:commit-all.v2/x"}, {"name": "résumé"}])] == ["git:commit-all.v2/x"]  # ASCII names only
 
 
 def test_listing_parsers_skip_malformed_duplicate_and_idless_entries():
@@ -601,3 +601,26 @@ def test_listing_parsers_skip_malformed_duplicate_and_idless_entries():
     raw = json.dumps([1, None, {"id": ""}, {"id": "a1", "name": "x"}, {"id": "a1", "name": "dupe"}, "s"])
     assert [(a.id, a.name) for a in parse_agents(raw)] == [("a1", "x")]
     assert parse_permissions("[1, null, {\"agentId\": \"a\", \"id\": \"p\"}]", "a")[0].id == "p"
+
+
+def test_permit_batch_allow_is_reviewable_only_deny_is_everything():
+    from herdr4paseo.core import PERMIT_BATCH, PERMIT_LABEL_MAX, Permission, permit_batch
+
+    perms = [Permission(id=f"p{i}", agent_id="a", name="Bash", description="x" * (PERMIT_LABEL_MAX if i == 1 else 5)) for i in range(9)]
+    allow = permit_batch(perms, "allow")
+    assert [p.id for p in allow] == ["p0", "p2", "p3", "p4"][:PERMIT_BATCH] and all(len(p.label) <= PERMIT_LABEL_MAX for p in allow)
+    assert len(permit_batch(perms, "deny")) == 9
+
+
+def test_every_record_field_is_size_capped_and_ascii_command_names_only():
+    from herdr4paseo.core import STORE_TEXT_LIMIT, apply_timeline_item, parse_commands, sanitize_text
+
+    timeline = []
+    for item in ({"type": "assistant_message", "text": "a" * 9_000_000}, {"type": "user_message", "text": "u" * 9_000_000},
+                 {"type": "error", "message": "e" * 9_000_000}, {"type": "tool_call", "callId": "c", "extra": {"k": "v" * 9_000_000}}):
+        apply_timeline_item(timeline, item, None)
+    assert all(len(v) <= STORE_TEXT_LIMIT + 10 for i in timeline for v in i.values() if isinstance(v, str))
+    assert [c.name for c in parse_commands([{"name": "he\u1160lp"}, {"name": "he\uffa0lp"}, {"name": "ok-1.x"}])] == ["ok-1.x"]
+    for ch in "\u206a\ufff9\u1160\uffa0\ufe00\U000e0100\u17b5":
+        assert sanitize_text(f"a{ch}b") == "a\ufffdb", hex(ord(ch))
+    assert sanitize_text("a\u200d\ufe0fb") == "a\u200d\ufe0fb"
