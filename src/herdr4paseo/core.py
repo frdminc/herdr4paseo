@@ -128,7 +128,7 @@ class Agent:
     @property
     def label(self) -> str:
         where = f"  {self.cwd}" if self.cwd else ""
-        return f"{self.short_id}  {self.status:<8} {self.name}  ({self.provider}){where}"
+        return sanitize_line(f"{self.short_id}  {self.status:<8} {self.name}  ({self.provider}){where}")
 
 
 def parse_agents(raw: str) -> list[Agent]:
@@ -215,7 +215,7 @@ class Permission:
 
     @property
     def label(self) -> str:
-        return f"{self.name}: {self.description}" if self.description not in ("", "-") else self.name
+        return sanitize_line(f"{self.name}: {self.description}" if self.description not in ("", "-") else self.name)
 
 
 def parse_permissions(raw: str, agent_id: str) -> list[Permission]:
@@ -245,7 +245,7 @@ class Command:
     @property
     def label(self) -> str:
         hint = f" {self.argument_hint}" if self.argument_hint else ""
-        return f"/{self.name}{hint}  {self.description}"
+        return sanitize_line(f"/{self.name}{hint}  {self.description}")
 
 
 def parse_commands(items: list[object]) -> list[Command]:
@@ -254,6 +254,8 @@ def parse_commands(items: list[object]) -> list[Command]:
     for item in items:
         if not isinstance(item, dict) or not item.get("name"):
             continue
+        if _CONTROLS.search(str(item["name"])) or any(c.isspace() for c in str(item["name"])):
+            continue  # Tab completion would insert this name into the prompt
         commands.append(
             Command(
                 name=str(item["name"]),
@@ -376,8 +378,13 @@ def _style_at(text: Text, offset: int) -> Style:
     return style
 
 
+MAX_HIGHLIGHT_LINE = 5_000
+
+
 def _highlight_links(text: Text, line: str) -> None:
     """Escalate the label of `[label](url)` links and the host of bare URLs; the rest stays as it was."""
+    if len(line) > MAX_HIGHLIGHT_LINE:  # the span scan below is quadratic in the number of URLs
+        return
     markdown = [m.span() for m in _LINK.finditer(line)]
     code = [m.span() for m in _INLINE_CODE.finditer(line)]
     spans = [m.span("label") for m in _LINK.finditer(line)]
@@ -573,7 +580,9 @@ def parse_timeline(raw: str) -> list[dict]:
     return items
 
 
-_CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# C0 (bar \n \t), DEL, C1, plus characters that reorder or hide text: bidi marks/embeddings/overrides/
+# isolates, zero-width space, word joiner, BOM, line/paragraph separators. ZWJ/ZWNJ stay (emoji, scripts).
+_CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060\u2066-\u2069\ufeff]")
 MAX_TEXT_CHARS = 256_000  # displayed per timeline item; the full text stays in memory
 MAX_DETAIL_CHARS = 64_000  # displayed tool-call detail
 
@@ -593,6 +602,11 @@ def sanitize_text(text: str) -> str:
     links, OSC 52 clipboard writes). They become visible stand-ins; `\n` and `\t` stay, CR is dropped.
     """
     return _CONTROLS.sub(_visible_control, text.replace("\r", ""))
+
+
+def sanitize_line(text: str) -> str:
+    """sanitize_text for one-line labels: newlines, tabs and CR become spaces (same length)."""
+    return sanitize_text(re.sub(r"[\r\n\t]", " ", text))
 
 
 def _clean(value: object, limit: int = MAX_TEXT_CHARS) -> str:
@@ -666,6 +680,18 @@ def apply_timeline_item(timeline: list[dict], item: dict, open_chain: int | None
                 return None
     timeline.append(item)
     return None
+
+
+MAX_TIMELINE_ITEMS = 500  # kept in memory; the oldest 100 go at a time so the render cache stays valid
+TRIM_BATCH = 100
+
+
+def trim_timeline(timeline: list[dict], open_chain: int | None) -> tuple[int | None, int]:
+    """Drop the oldest TRIM_BATCH items once the timeline passes MAX_TIMELINE_ITEMS + TRIM_BATCH."""
+    if len(timeline) <= MAX_TIMELINE_ITEMS + TRIM_BATCH:
+        return open_chain, 0
+    del timeline[:TRIM_BATCH]
+    return (None if open_chain is None or open_chain < TRIM_BATCH else open_chain - TRIM_BATCH), TRIM_BATCH
 
 
 MAX_RECORD_BYTES = 8 * 1024 * 1024  # one `paseo logs --json` record; larger ones are skipped, not buffered

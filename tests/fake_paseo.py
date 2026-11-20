@@ -7,7 +7,7 @@ import sys
 import time
 
 AGENTS = [
-    {"id": "aaaaaaa1-0000-0000-0000-000000000001", "shortId": "aaaaaaa", "name": "alpha",
+    {"id": "aaaaaaa1-0000-0000-0000-000000000001", "shortId": "aaaaaaa", "name": os.environ.get("FAKE_PASEO_NAME", "alpha"),
      "provider": "claude/x", "status": os.environ.get("FAKE_PASEO_STATUS", "running"), "cwd": "~/src/a", "created": "1 days ago"},
     {"id": "bbbbbbb2-0000-0000-0000-000000000002", "shortId": "bbbbbbb", "name": "beta",
      "provider": "codex/y", "status": "idle", "cwd": "~/src/b", "created": "2 days ago"},
@@ -43,6 +43,14 @@ elif cmd == "logs":
         if mode == "stderrbig":  # a stderr line over asyncio's 64 KiB limit
             sys.stderr.write("e" * 200_000 + "\n")
             sys.stderr.flush()
+        if mode == "deep":  # a record nested far past Python's recursion limit, then a normal one
+            deep = "[" * 100_000 + "]" * 100_000
+            items = []
+            if "-f" in sys.argv:
+                print(deep, flush=True)
+            items = [{"type": "assistant_message", "text": "after the deep record", "messageId": "d1"}]
+        if mode == "bigtools":  # more rendered text than one redraw's budget
+            items = [{"type": "tool_call", "callId": f"t{i}", "name": "Shell", "status": "ok", "detail": {"out": "z" * 200_000}} for i in range(12)]
         if mode == "badtype":  # a wrong-typed field must be skipped, not kill the app
             items = [
                 {"type": "reasoning", "text": "a"},

@@ -42,7 +42,9 @@ from .core import (
     logs_argv,
     MAX_LOG_LINE_BYTES,
     MAX_RECORD_BYTES,
+    sanitize_line,
     sanitize_text,
+    trim_timeline,
     apply_timeline_item,
     iter_record_lines,
     timeline_argv,
@@ -65,6 +67,8 @@ from .core import (
 from .daemon import DaemonError, fetch_commands
 
 STATUS_POLL_SECONDS = 3.0
+MAX_LOG_LINES = 20_000  # per RichLog: older lines scroll off instead of growing memory forever
+RENDER_BUDGET_CHARS = 512_000  # newest items rendered per chat redraw; older ones show as a count
 RENDER_SECONDS = 0.1  # at most ~10 chat re-renders a second however fast records arrive
 RECONNECT_SECONDS = 3.0
 
@@ -179,7 +183,7 @@ class ConfirmStop(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         yield Static(
-            f"STOP agent {self._agent.name} ({self._agent.short_id}, {self._agent.status})?\n\n[y] yes   [n] no",
+            sanitize_text(f"STOP agent {self._agent.name} ({self._agent.short_id}, {self._agent.status})?") + "\n\n[y] yes   [n] no",
             id="confirm-box",
             markup=False,
         )
@@ -296,7 +300,7 @@ class Herdr4PaseoApp(App[None]):
         self.tools_only = False
         self.chat_view = False
         self.timeline: list[dict] = []
-        self._rendered: list[tuple[dict, Text]] = []  # render cache aligned with self.timeline
+        self._rendered: dict[int, tuple[dict, Text]] = {}  # render cache by timeline index
         self._render_timer = None  # pending coalesced render
         self._open_chain: int | None = None  # index of the assistant/reasoning text still receiving deltas
         self.agent: Agent | None = None
@@ -311,8 +315,8 @@ class Herdr4PaseoApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical():
-            yield RichLog(id="log", wrap=True, markup=False, highlight=False, auto_scroll=True)
-            yield RichLog(id="chat", classes="hidden", wrap=True, markup=False, highlight=False)
+            yield RichLog(id="log", wrap=True, markup=False, highlight=False, auto_scroll=True, max_lines=MAX_LOG_LINES)
+            yield RichLog(id="chat", classes="hidden", wrap=True, markup=False, highlight=False, max_lines=MAX_LOG_LINES)
             yield Static("", id="permits", classes="hidden", markup=False)
             yield Static("", id="slash", classes="hidden", markup=False)
             yield PromptArea(id="prompt")
@@ -357,7 +361,7 @@ class Herdr4PaseoApp(App[None]):
             return
         self.agent = picked
         self._last_status = picked.status
-        self.title = f"{picked.name} ({picked.short_id})"
+        self.title = sanitize_line(f"{picked.name} ({picked.short_id})")
         self._update_subtitle(picked.status)
         self._start_stream()
         self._load_commands(picked.id)
@@ -413,6 +417,7 @@ class Herdr4PaseoApp(App[None]):
 
     def _update_subtitle(self, status: str) -> None:
         view = "tools only" if self.tools_only else "full log"
+        status = sanitize_line(status)
         self.sub_title = f"{status} | send: {self.behavior} | {'chat' if self.chat_view else 'log'} | {view}"
 
     # -- log stream -----------------------------------------------------------------
@@ -461,29 +466,54 @@ class Herdr4PaseoApp(App[None]):
         """Fold records into the timeline now; the visible re-render is coalesced (RENDER_SECONDS)."""
         for item in parse_timeline(raw):
             self._open_chain = apply_timeline_item(self.timeline, item, self._open_chain)
+        self._open_chain, dropped = trim_timeline(self.timeline, self._open_chain)
+        if dropped:
+            self._rendered = {}
         if self._render_timer is None:
             self._render_timer = self.set_timer(RENDER_SECONDS, self._render_timeline)
 
     def _render_timeline(self) -> None:
+        """Redraw the newest items that fit RENDER_BUDGET_CHARS; unchanged items reuse their cached Text."""
         self._render_timer = None
-        cache = self._rendered
-        rendered: list[tuple[dict, Text]] = []
         try:
             log = self.query_one("#chat", RichLog)
         except NoMatches:  # the timer fired while the app was shutting down
             return
-        log.clear()
-        for i, item in enumerate(self.timeline):
+        try:
+            self._redraw_chat(log)
+        except Exception as exc:  # a render bug must not take the app (and its permit banner) down
+            self._note(f"chat render failed: {type(exc).__name__}", "error.text")
+
+    def _redraw_chat(self, log: RichLog) -> None:
+        cache, budget, shown = self._rendered, RENDER_BUDGET_CHARS, []
+        hidden = 0
+        for i in range(len(self.timeline) - 1, -1, -1):
+            item = self.timeline[i]
+            if self.tools_only and item["type"] != "tool_call":
+                continue
+            if budget <= 0:
+                hidden += 1
+                continue
             # apply_timeline_item swaps in a new dict for every change, so `is` finds the unchanged items
-            text = cache[i][1] if i < len(cache) and cache[i][0] is item else render_timeline_item(item)
-            rendered.append((item, text))
-            if not self.tools_only or item["type"] == "tool_call":
-                log.write(text)
-                log.write("")
-        self._rendered = rendered
+            if i in cache and cache[i][0] is item:
+                text = cache[i][1]
+            else:
+                try:
+                    text = render_timeline_item(item)
+                except Exception:
+                    text = Text("[unrenderable record]", style=style_for("error.text"))
+                cache[i] = (item, text)
+            budget -= len(text.plain)
+            shown.append(text)
+        log.clear()
+        if hidden:
+            log.write(Text(f"... {hidden} earlier items not shown", style=style_for("meta")))
+        for text in reversed(shown):
+            log.write(text)
+            log.write("")
 
     def _reset_timeline(self) -> None:
-        self.timeline, self._rendered, self._open_chain = [], [], None
+        self.timeline, self._rendered, self._open_chain = [], {}, None
         if self._render_timer is not None:
             self._render_timer.stop()
             self._render_timer = None
@@ -516,7 +546,7 @@ class Herdr4PaseoApp(App[None]):
                         continue
                     try:
                         self._apply_timeline(line.decode(errors="replace"))
-                    except (ValueError, TypeError, AttributeError, KeyError):  # malformed record: skip it, keep the stream
+                    except (ValueError, TypeError, AttributeError, KeyError, RecursionError):  # malformed record: skip it, keep the stream
                         self._note("invalid timeline JSON record", "error.text")
                 await proc.wait()
             finally:

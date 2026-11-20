@@ -503,3 +503,48 @@ def test_render_timeline_item_clips_huge_text_and_detail_and_tolerates_wrong_typ
     assert len(reply.plain) < MAX_TEXT_CHARS + 500
     for item in ({"type": "assistant_message", "text": None}, {"type": "todo", "items": "abc"}, {"type": "todo", "items": [1]}):
         render_timeline_item(item)  # no AttributeError
+
+
+# -- round 3: labels, bidi/zero-width, bounds -------------------------------------------------------
+
+
+def test_sanitize_text_neutralizes_bidi_zero_width_and_separators_but_keeps_zwj():
+    from herdr4paseo.core import sanitize_text
+
+    for ch in "‮‪⁦⁩‎‏؜​⁠﻿  ":
+        assert sanitize_text(f"a{ch}b") == "a�b", hex(ord(ch))
+    assert sanitize_text("\U0001f3f3️‍\U0001f308 e‌n") == "\U0001f3f3️‍\U0001f308 e‌n"
+
+
+def test_agent_permission_and_command_labels_are_inert_single_lines():
+    from herdr4paseo.core import Agent, Command, Permission, agent_label_text, parse_commands
+
+    conceal = "rm -rf ~\x1b[8m hidden\x1b]52;c;eA==\x07\n  - ALLOW fake‮"
+    agent = Agent(id="i", short_id="s\x1b[2J", name=conceal, provider="p\x9b", status="running", cwd="/c\x1b]0;t\x07")
+    perm = Permission(id="1", agent_id="i", name="Bash\x1b[8m", description=conceal)
+    cmd = Command(name="ok", description=conceal, argument_hint="<a\x1b>", kind="command")
+    for label in (agent.label, perm.label, cmd.label, agent_label_text(agent).plain):
+        assert "\n" not in label and not any(c in label for c in "\x1b\x07\x9b‮"), label
+    assert "rm -rf ~" in perm.label  # still shown, just inert
+    names = [c.name for c in parse_commands([{"name": "good"}, {"name": "ev\x1bil"}, {"name": "sp ace"}, {"name": "tab\tx"}])]
+    assert names == ["good"]
+
+
+def test_trim_timeline_drops_in_batches_and_shifts_the_open_chain():
+    from herdr4paseo.core import MAX_TIMELINE_ITEMS, TRIM_BATCH, trim_timeline
+
+    tl = [{"type": "user_message", "text": str(i)} for i in range(MAX_TIMELINE_ITEMS + TRIM_BATCH)]
+    assert trim_timeline(tl, 5) == (5, 0) and len(tl) == MAX_TIMELINE_ITEMS + TRIM_BATCH
+    tl.append({"type": "user_message", "text": "x"})
+    chain, dropped = trim_timeline(tl, len(tl) - 1)
+    assert dropped == TRIM_BATCH and chain == len(tl) - 1 and tl[0]["text"] == str(TRIM_BATCH)
+    assert trim_timeline([{"type": "x"}] * (MAX_TIMELINE_ITEMS + TRIM_BATCH + 1), 3)[0] is None  # chain fell off
+
+
+def test_link_highlighting_skips_pathologically_long_lines():
+    from herdr4paseo.core import MAX_HIGHLIGHT_LINE, LogStyler
+
+    line = "see https://example.com/x " * (MAX_HIGHLIGHT_LINE // 20)
+    assert len(line) > MAX_HIGHLIGHT_LINE
+    assert LogStyler().style(line).spans == []
+    assert LogStyler().style("see https://example.com/x").spans  # short lines still highlight

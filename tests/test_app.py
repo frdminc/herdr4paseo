@@ -724,3 +724,68 @@ async def test_chat_coalesces_rerenders_of_many_fragments(calls, monkeypatch):
         assert "abab" in all_text(app, "#chat")
     # 300 fragments must not mean 300 renders (200 would still be N full re-renders)
     assert 1 <= len(rendered) <= 30, len(rendered)
+
+
+# -- round 3: other displayed strings, bounds, recursion --------------------------------------------
+
+HOSTILE = "rm -rf ~\x1b[8m hidden\x1b]52;c;eA==\x07 ‮"
+
+
+async def test_permit_banner_title_and_dialogs_are_inert(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_NAME", "al\x1b]0;pwned\x07pha")
+    permits = [{"id": "p1", "agentId": "aaaaaaa1-0000-0000-0000-000000000001", "agentShortId": "aaaaaaa", "name": "Bash\x1b[8m", "description": HOSTILE}]
+    monkeypatch.setenv("FAKE_PASEO_PERMITS", json.dumps(permits))
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if app.permits:
+                break
+        bad = "\x1b\x07\x9b‮"
+        assert "pwned" in app.title and not any(c in app.title + app.sub_title for c in bad)
+        banner = app.query_one("#permits").render()
+        banner_text = getattr(banner, "plain", str(banner))
+        assert "rm -rf ~" in banner_text and not any(c in banner_text for c in bad)
+        await pilot.press("ctrl+a")
+        await pilot.pause(0.2)
+        dialog = app.screen.query_one("#confirm-box").render()
+        dialog_text = getattr(dialog, "plain", str(dialog))
+        assert "rm -rf ~" in dialog_text and not any(c in dialog_text for c in bad)
+        await pilot.press("n")
+
+
+async def test_chat_skips_a_record_nested_past_the_recursion_limit(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_JSON_MODE", "deep")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+v")
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if any(i.get("text") == "after the deep record" for i in app.timeline):
+                break
+        assert any(i.get("text") == "after the deep record" for i in app.timeline)
+        assert "invalid timeline JSON record" in log_text(app) and app.is_running
+
+
+async def test_chat_redraw_is_budgeted_and_a_render_failure_does_not_exit(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_JSON_MODE", "bigtools")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+v")
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if "earlier items not shown" in all_text(app, "#chat"):
+                break
+        assert len(app.timeline) == 12 and "earlier items not shown" in all_text(app, "#chat")
+        assert app.query_one("#log", RichLog).max_lines == app_module.MAX_LOG_LINES
+        # a failing renderer degrades to a placeholder; a failing redraw becomes a note, never an exit
+        monkeypatch.setattr(app_module, "render_timeline_item", lambda item: 1 / 0)
+        app._rendered = {}
+        app._render_timeline()
+        assert "[unrenderable record]" in all_text(app, "#chat")
+        monkeypatch.setattr(app, "_redraw_chat", lambda log: 1 / 0)
+        app._render_timeline()
+        assert "chat render failed: ZeroDivisionError" in log_text(app) and app.is_running
