@@ -35,6 +35,12 @@ elif cmd == "logs":
                 {"type": "tool_call", "callId": "big", "name": "Shell", "status": "completed", "detail": {"output": "x" * 300_000}},
                 {"type": "assistant_message", "text": "after the big record", "messageId": "m2"},
             ]
+        if mode == "badtype":  # a wrong-typed field must be skipped, not kill the app
+            items = [
+                {"type": "reasoning", "text": "a"},
+                {"type": "reasoning", "text": 1},
+                {"type": "assistant_message", "text": "still alive", "messageId": "m3"},
+            ]
         if "-f" in sys.argv:
             for item in items:
                 print(json.dumps(item), flush=True)

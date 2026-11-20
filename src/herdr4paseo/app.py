@@ -485,7 +485,7 @@ class Herdr4PaseoApp(App[None]):
                         continue
                     try:
                         self._apply_timeline(line.decode(errors="replace"))
-                    except (ValueError, json.JSONDecodeError):
+                    except (ValueError, TypeError, AttributeError, KeyError):  # malformed record: skip it, keep the stream
                         self._note("invalid timeline JSON record", "error.text")
                 await proc.wait()
             finally:

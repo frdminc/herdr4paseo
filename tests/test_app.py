@@ -614,3 +614,18 @@ async def test_chat_skips_an_oversized_record_with_a_notice(calls, monkeypatch):
         assert [i["type"] for i in app.timeline] == ["assistant_message"]
         assert "skipped a timeline record over" in log_text(app)
         assert app.is_running
+
+
+async def test_chat_skips_a_wrong_typed_record_and_keeps_running(calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_JSON_MODE", "badtype")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+v")
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if any(i.get("text") == "still alive" for i in app.timeline):
+                break
+        assert any(i.get("text") == "still alive" for i in app.timeline)
+        assert "invalid timeline JSON record" in log_text(app)
+        assert app.is_running
