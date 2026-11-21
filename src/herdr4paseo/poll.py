@@ -10,6 +10,7 @@ load spike. The schedule here polls one agent with `paseo agent inspect <id> --j
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from collections.abc import Callable, Mapping
@@ -31,7 +32,7 @@ def _seconds(env: Mapping[str, str], name: str, default: float) -> float:
         value = float(env[name])
     except (KeyError, ValueError):
         return default
-    return max(MIN_SECONDS, value) if value == value else default  # NaN keeps the default
+    return max(MIN_SECONDS, value) if math.isfinite(value) else default  # NaN and inf keep the default
 
 
 @dataclass(frozen=True)
@@ -41,14 +42,15 @@ class PollConfig:
     active: agent running or a request pending. A permission request can only arise while a turn
         runs, so this bounds how late an allow banner appears (about `active`, plus one probe).
     idle: first interval for a settled (not running) agent; doubles each unchanged poll.
-    idle_max: ceiling of that backoff.
+    idle_max: ceiling of that backoff. It is also the worst-case wait for a turn started elsewhere
+        that never reaches the log stream (a hint wakes the poll when output does arrive).
     fast: cadence just after a user action, an observed change or fresh log activity.
     burst: how long `fast` lasts after such an event.
     """
 
     active: float = 5.0
     idle: float = 15.0
-    idle_max: float = 60.0
+    idle_max: float = 30.0
     fast: float = 3.0
     burst: float = 15.0
 
@@ -74,6 +76,7 @@ class PollSchedule:
         self._clock = clock
         self._seen: tuple[str, int] | None = None  # (status, pending requests) at the last poll
         self._unchanged = 0  # consecutive polls that saw the same thing
+        self._quiet = False  # the previous poll ran outside a burst and changed nothing
         self._boost_until = clock() + self.config.burst  # a fresh attach polls fast for a moment
         self._last_hint = float("-inf")
 
@@ -85,7 +88,10 @@ class PollSchedule:
         """Record a poll result; True when it differs from the previous one (which starts a burst)."""
         seen = (status, pending)
         changed = self._seen is not None and seen != self._seen
-        self._unchanged = 0 if changed or self._seen is None else self._unchanged + 1
+        # polls inside a burst do not count towards the back-off: it starts from `idle` once the burst ends
+        burst = self._clock() < self._boost_until
+        self._unchanged = self._unchanged + 1 if self._quiet and not changed else 0
+        self._quiet = not burst and not changed
         self._seen = seen
         if changed:
             self._boost_until = self._clock() + self.config.burst
@@ -95,21 +101,23 @@ class PollSchedule:
         """A user action (send, answer, stop, attach) probably changes the agent: poll fast for a while."""
         self._boost_until = self._clock() + self.config.burst
         self._unchanged = 0
+        self._quiet = False
 
     def log_activity(self) -> bool:
         """The log stream produced output. True asks the app to poll now rather than wait.
 
         Only a settled agent can wake up unseen (it is the long wait), so only then, and at most
-        once per `idle` seconds: output while running or replayed on reattach costs nothing.
+        once per `min(idle, burst)` seconds: output while running or replayed on reattach costs nothing.
         """
         now = self._clock()
         if self.status == "running" or (self._seen and self._seen[1]) or now < self._boost_until:
             return False
-        if now - self._last_hint < self.config.idle:
+        if now - self._last_hint < min(self.config.idle, self.config.burst):
             return False
         self._last_hint = now
         self._boost_until = now + self.config.burst
         self._unchanged = 0
+        self._quiet = False
         return True
 
     def delay(self) -> float:

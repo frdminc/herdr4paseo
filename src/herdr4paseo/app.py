@@ -449,6 +449,8 @@ class Herdr4PaseoApp(App[None]):
             return
         agent_id, before = self.agent.id, len(self.permits)
         probe = await self._probe_agent(agent_id)
+        if self.agent is None or self.agent.id != agent_id:
+            return  # switched agent during the probe: its answer must not touch the new agent's banner
         if probe is not None:
             status, pending = probe
             if pending:
@@ -456,6 +458,7 @@ class Herdr4PaseoApp(App[None]):
             elif self.permits:
                 self._show_permits([])  # answered elsewhere
         else:  # old paseo or an odd answer: the full listing plus `permit ls`, as before
+            pending = False
             current = find_agent(await self._list_agents(), agent_id)
             status = current.status if current is not None else None
             await self._refresh_permits()
@@ -464,7 +467,7 @@ class Herdr4PaseoApp(App[None]):
         if status is None:
             return
         self._update_subtitle(status)
-        self._poll.observe(status, len(self.permits))
+        self._poll.observe(status, len(self.permits) or int(pending))
         reason = should_alert(self._last_status, status, before, len(self.permits))
         self._last_status = status
         if reason:

@@ -21,7 +21,7 @@ def schedule(clock: Clock, **overrides) -> PollSchedule:
 
 def test_defaults_are_much_slower_than_the_old_three_second_tick():
     cfg = PollConfig()
-    assert (cfg.active, cfg.idle, cfg.idle_max, cfg.fast, cfg.burst) == (5.0, 15.0, 60.0, 3.0, 15.0)
+    assert (cfg.active, cfg.idle, cfg.idle_max, cfg.fast, cfg.burst) == (5.0, 15.0, 30.0, 3.0, 15.0)
 
 
 def test_fresh_attach_polls_fast_for_one_burst_then_settles():
@@ -41,7 +41,7 @@ def test_idle_agent_backs_off_while_nothing_changes_up_to_the_ceiling():
     for _ in range(6):
         poll.observe("idle", 0)
         delays.append(poll.delay())
-    assert delays == [15.0, 30.0, 60.0, 60.0, 60.0, 60.0]
+    assert delays == [15.0, 30.0, 30.0, 30.0, 30.0, 30.0]
 
 
 def test_running_agent_polls_at_the_active_rate_and_never_backs_off():
@@ -68,7 +68,7 @@ def test_a_change_snaps_back_to_fast_then_decays():
     clock.now += 100
     for _ in range(4):
         poll.observe("idle", 0)
-    assert poll.delay() == 60.0
+    assert poll.delay() == 30.0
     assert poll.observe("running", 0) is True
     assert poll.delay() == 3.0
     clock.now += 15.0
@@ -115,10 +115,32 @@ def test_log_activity_is_free_while_running_or_a_request_waits():
     assert poll.log_activity() is False
 
 
+def test_polls_inside_a_burst_do_not_count_towards_the_backoff():
+    clock = Clock()
+    poll = schedule(clock)
+    for _ in range(5):  # five fast polls while the attach burst is still on
+        poll.observe("idle", 0)
+        clock.now += 3.0
+    clock.now += 100
+    poll.observe("idle", 0)
+    assert poll.delay() == 15.0  # starts from `idle`, not from the 30 s ceiling
+
+
+def test_log_hint_throttle_never_outlasts_a_short_burst():
+    clock = Clock()
+    poll = schedule(clock, burst=2.0)
+    clock.now += 100
+    poll.observe("idle", 0)
+    assert poll.log_activity() is True
+    clock.now += 2.5  # burst (2 s) over; idle is 15 s but the throttle is min(idle, burst)
+    assert poll.log_activity() is True
+
+
 def test_environment_overrides_clamp_and_ignore_garbage():
     cfg = PollConfig.from_env({"HERDR4PASEO_POLL_ACTIVE": "9", "HERDR4PASEO_POLL_IDLE": "0",
                                "HERDR4PASEO_POLL_FAST": "soon", "HERDR4PASEO_POLL_BURST": "nan",
                                "HERDR4PASEO_POLL_IDLE_MAX": "1"})
+    assert PollConfig.from_env({"HERDR4PASEO_POLL_ACTIVE": "inf"}).active == 5.0  # inf would stop polling a running agent
     assert cfg.active == 9.0
     assert cfg.idle == 0.5  # never below the floor, so a typo cannot spin the CLI
     assert cfg.fast == 3.0 and cfg.burst == 15.0  # unparsable: default

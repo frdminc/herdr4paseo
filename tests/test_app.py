@@ -1092,3 +1092,49 @@ async def test_poll_falls_back_to_ls_when_inspect_fails(calls, monkeypatch):
         await settle(pilot, app, "alert: agent idle")  # still noticed, through the old ls path
     rec = recorded(calls)
     assert sum(c[:2] == ["ls", "-g"] for c in rec) >= 2 and rings
+
+
+async def test_log_output_wakes_a_backed_off_idle_agent(calls, monkeypatch):
+    fast_polls(monkeypatch, IDLE="30", IDLE_MAX="30", ACTIVE="30", FAST="0.5", BURST="0.5")
+    monkeypatch.setenv("FAKE_PASEO_STATUS", "idle")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+
+    def probes() -> int:
+        return sum(c[:2] == ["agent", "inspect"] for c in recorded(calls))
+
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.pause(1.5)  # the attach burst ends; the next scheduled poll is 30 s away
+        before = probes()
+        await pilot.pause(1.0)
+        assert probes() == before  # really backed off
+        await pilot.press("ctrl+o")  # restarts the log stream: fresh output reaches the app
+        for _ in range(60):
+            await pilot.pause(0.05)
+            if probes() > before:
+                break
+        assert probes() > before  # woken by the output, not by the 30 s timer
+
+
+async def test_a_probe_in_flight_for_the_old_agent_never_clears_the_new_agents_banner(calls, monkeypatch):
+    fast_polls(monkeypatch, ACTIVE="30", IDLE="30", IDLE_MAX="30", FAST="0.5", BURST="0.5")
+    agent_b = "bbbbbbb2-0000-0000-0000-000000000002"
+    permits = [{"id": "pb", "agentId": agent_b, "agentShortId": "bbbbbbb", "name": "Bash", "description": "ls"}]
+    monkeypatch.setenv("FAKE_PASEO_PERMITS", json.dumps(permits))
+    monkeypatch.setenv("FAKE_PASEO_INSPECT_SLEEP_A", "1.5")
+    shown = []
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    original = app._show_permits
+    monkeypatch.setattr(app, "_show_permits", lambda p: (shown.append([x.id for x in p]), original(p))[1])
+    async with app.run_test() as pilot:
+        await wait_for_calls(pilot, calls, lambda c: any(x[:2] == ["agent", "inspect"] for x in c))  # alpha's slow probe is running
+        app._choose_agent("bbbbbbb")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if [p.id for p in app.permits] == ["pb"]:
+                break
+        assert [p.id for p in app.permits] == ["pb"]
+        shown.clear()
+        await pilot.pause(2.0)  # alpha's probe returns "nothing pending" in here
+        assert [] not in shown
+        assert [p.id for p in app.permits] == ["pb"]

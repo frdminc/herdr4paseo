@@ -78,7 +78,7 @@ The terminal bell rings, with a yellow `alert:` line in the log, when the shown 
 | `HERDR4PASEO_HISTORY` | Path of the prompt-history file (default `~/.local/state/herdr4paseo/history.json`, the last 200 prompts, shared by all agents). |
 | `PASEO_BIN` | Path to the `paseo` executable to run (default `paseo`). The tests point it at a fake. |
 | `NO_COLOR` | Turns colour off (bold, italic and dim stay). Textual treats an empty `NO_COLOR=` as set too, which is stricter than [no-color.org](https://no-color.org). See [Colours](docs/usage.md#colours). |
-| `HERDR4PASEO_POLL_ACTIVE`, `_IDLE`, `_IDLE_MAX`, `_FAST`, `_BURST` | Status-poll intervals in seconds (defaults 5, 15, 60, 3, 15; minimum 0.5). See [Polling](#polling). |
+| `HERDR4PASEO_POLL_ACTIVE`, `_IDLE`, `_IDLE_MAX`, `_FAST`, `_BURST` | Status-poll intervals in seconds (defaults 5, 15, 30, 3, 15; minimum 0.5). See [Polling](#polling). |
 | `TEXTUAL_COLOR_SYSTEM` | Force the colour depth: `auto` (default), `standard` (16 colours), `256` or `truecolor`. |
 
 ## Polling
@@ -88,10 +88,10 @@ Each status poll starts a `paseo` Node process, so the schedule is deliberately 
 | Situation | Interval | Variable |
 | --- | --- | --- |
 | Agent running, or a request pending | 5 s | `HERDR4PASEO_POLL_ACTIVE` |
-| Agent not running | 15 s, doubling while nothing changes, up to 60 s | `HERDR4PASEO_POLL_IDLE`, `HERDR4PASEO_POLL_IDLE_MAX` |
+| Agent not running | 15 s, doubling while nothing changes, up to 30 s | `HERDR4PASEO_POLL_IDLE`, `HERDR4PASEO_POLL_IDLE_MAX` |
 | For `HERDR4PASEO_POLL_BURST` (15 s) after attaching, sending, answering a request, stopping, or an observed change | 3 s | `HERDR4PASEO_POLL_FAST`, `HERDR4PASEO_POLL_BURST` |
 
-A permission request can only arise while a turn is running, so the 5 s rate while running bounds how late the banner and bell appear (about 5 s, plus the probe's own run time). A settled agent that starts producing log output is polled at once (at most once per idle interval), so waking up in the Paseo app is noticed in seconds, not after a 60 s back-off. Before this schedule every instance ran `paseo ls -g -a --json` (a listing of every agent, about 1 MB) and `paseo permit ls --json` every 3 s.
+A permission request can only arise while a turn is running, so once herdr4paseo has seen the agent running, the banner and bell appear within about 5 s (plus the probe's own run time). A settled agent that starts producing log output is polled within about 3 s (at most once per 15 s of idle-time hints), so a turn started in the Paseo app is noticed in seconds. A turn started elsewhere that writes nothing to the log stream (for example in the tools-only view before its first tool call) is noticed at the next idle poll, at most 30 s later. Before this schedule every instance ran `paseo ls -g -a --json` (a listing of every agent, about 1 MB) and `paseo permit ls --json` every 3 s.
 
 ## Limits
 

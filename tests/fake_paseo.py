@@ -103,6 +103,8 @@ elif cmd == "agent" and sys.argv[2] == "inspect":  # one agent, capitalised keys
         print("unknown command", file=sys.stderr)
         sys.exit(1)
     agent = next(a for a in AGENTS if a["id"] == sys.argv[3])
+    if agent["shortId"] == "aaaaaaa":
+        time.sleep(float(os.environ.get("FAKE_PASEO_INSPECT_SLEEP_A", "0")))  # a slow probe for alpha
     queue = [q for q in json.loads(pending_permits()) if q["agentId"] == agent["id"]]
     print(json.dumps({"Id": agent["id"], "Name": agent["name"], "Status": agent["status"],
                       "PendingPermissions": [{"id": q["id"], "tool": q["name"]} for q in queue]}, indent=2))
