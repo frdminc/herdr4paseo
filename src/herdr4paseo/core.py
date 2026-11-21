@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -164,6 +165,53 @@ def find_agent(agents: list[Agent], ident: str) -> Agent | None:
         return exact[0]
     prefixed = [a for a in agents if a.id.startswith(ident)]
     return prefixed[0] if len(prefixed) == 1 else None
+
+
+# The follow file must hold a full agent UUID: a short id or prefix could match another agent
+# (find_agent falls back to a unique prefix) if a writer is caught half way through.
+FOLLOW_ID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+FOLLOW_FILE_MAX_BYTES = 4096
+
+
+def read_follow_id(path: str) -> tuple[str | None, str]:
+    """Read the one full agent id (lower-cased) held in `path`: (id, "") or (None, why it cannot be used yet).
+
+    Never raises, and never waits for a FIFO's writer (it opens non-blocking and refuses anything but a
+    regular file; a hung network mount can still stall the read). A missing, unreadable, special, empty
+    or garbled file is a state to wait out, not a reason to close the tab. Surrounding whitespace and
+    blank lines are ignored.
+    """
+    try:
+        # O_NONBLOCK: opening a FIFO must not wait for a writer (it would freeze the event loop)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, f"follow file {path} does not exist yet; waiting for it"
+    except OSError as exc:
+        return None, f"cannot read follow file {path}: {exc.strerror or exc}; waiting"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, f"follow file {path} is not a regular file; waiting"
+        raw = os.read(fd, FOLLOW_FILE_MAX_BYTES + 1)
+    except OSError as exc:
+        return None, f"cannot read follow file {path}: {exc.strerror or exc}; waiting"
+    finally:
+        os.close(fd)
+    if len(raw) > FOLLOW_FILE_MAX_BYTES:
+        return None, f"follow file {path} is over {FOLLOW_FILE_MAX_BYTES} bytes, not an agent id; waiting"
+    try:
+        lines = [line.strip() for line in raw.decode().splitlines() if line.strip()]
+    except UnicodeDecodeError:
+        return None, f"follow file {path} is not text, not an agent id; waiting"
+    if not lines:
+        return None, f"follow file {path} is empty; waiting for an agent id"
+    if len(lines) > 1 or not FOLLOW_ID_RE.fullmatch(lines[0]):
+        return None, f"follow file {path} does not hold a single agent id (a full UUID); waiting"
+    return lines[0].lower(), ""
+
+
+def find_followed_agent(agents: list[Agent], ident: str) -> Agent | None:
+    """The agent whose full id is `ident`. Unlike find_agent there is no short-id or prefix match."""
+    return next((a for a in agents if a.id.lower() == ident), None)
 
 
 def filter_agents(agents: list[Agent], query: str) -> list[Agent]:
@@ -336,6 +384,11 @@ def stop_argv(agent_id: str) -> list[str]:
 def ls_argv() -> list[str]:
     # -g: all workspaces; -a: archived too, so an agent you attached to stays findable.
     return [paseo_bin(), "ls", "-g", "-a", "--json"]
+
+
+def ls_active_argv() -> list[str]:
+    # Without -a, archived agents are left out: an id in `ls_argv` output but not here is archived.
+    return [paseo_bin(), "ls", "-g", "--json"]
 
 
 def logs_argv(agent: str, *, tail: int, tools_only: bool) -> list[str]:
