@@ -1,5 +1,7 @@
 import ast
 import json
+import os
+import re
 import stat
 from pathlib import Path
 
@@ -41,7 +43,9 @@ def recorded(path: Path) -> list[list[str]]:
 
 
 def log_text(app: Herdr4PaseoApp) -> str:
-    return "\n".join(line.text for line in app.query_one("#log", RichLog).lines)
+    """The log with whitespace collapsed: the 80-column view wraps a phrase onto two lines, depending on
+    the length of the temp path a notice carries, so a needle must not depend on where it wraps."""
+    return re.sub(r"\s+", " ", "\n".join(line.text for line in app.query_one("#log", RichLog).lines))
 
 
 async def settle(pilot, app, needle: str) -> None:
@@ -510,7 +514,10 @@ async def test_ctrl_l_opens_the_agent_picker_and_ctrl_g_does_not(calls):
         await pilot.pause(0.2)
         assert type(app.screen).__name__ not in ("PickAgent",)
         await pilot.press("ctrl+l")
-        await pilot.pause(0.2)
+        for _ in range(100):  # a loaded machine can take longer than a fixed pause
+            await pilot.pause(0.05)
+            if type(app.screen).__name__ == "PickAgent":
+                break
         assert type(app.screen).__name__ == "PickAgent"
 
 
@@ -1020,6 +1027,389 @@ async def test_allow_dialog_fits_an_80x24_screen_with_wide_text(calls, monkeypat
         assert "[y] yes" in text and box.region.bottom <= 24 and box.region.y >= 0, (box.region, text[-80:])
         assert "evil.example" not in text
         await pilot.press("n")
+
+
+# -- --follow-file ------------------------------------------------------------------
+
+AGENT_B = "bbbbbbb2-0000-0000-0000-000000000002"
+
+
+@pytest.fixture
+def follow(calls, tmp_path, monkeypatch):
+    """A follow file path and a pid log; the file is polled every 50 ms."""
+    monkeypatch.setattr(app_module, "FOLLOW_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(app_module, "FOLLOW_RETRY_SECONDS", 0.1)
+    monkeypatch.setenv("FAKE_PASEO_PIDS", str(tmp_path / "pids.txt"))
+    return tmp_path / "lead"
+
+
+def write_atomically(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def logs_agents(calls_path: Path) -> list[str]:
+    return [c[1] for c in recorded(calls_path) if c[0] == "logs"]
+
+
+async def logs_seen(pilot, calls_path: Path, agent_id: str) -> None:
+    for _ in range(100):
+        await pilot.pause(0.05)
+        if agent_id in logs_agents(calls_path):
+            return
+    raise AssertionError(f"no `paseo logs {agent_id}` was started")
+
+
+async def title_is(pilot, app, title: str) -> None:
+    for _ in range(100):
+        await pilot.pause(0.05)
+        if app.title == title:
+            return
+    raise AssertionError(f"title {title!r} never appeared; it is {app.title!r}")
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def test_follow_attaches_to_the_initial_id(follow, calls):
+    follow.write_text(AGENT_A + "\n")
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        assert app.title == "alpha (aaaaaaa)"
+    assert logs_agents(calls) == [AGENT_A]  # attached directly: no picker, no second stream
+
+
+async def test_follow_switches_when_the_id_changes_and_ends_the_old_stream(follow, calls, tmp_path):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+        await settle(pilot, app, "plain assistant line")
+        old_pid = int((tmp_path / "pids.txt").read_text().split()[1])
+        assert alive(old_pid)
+        write_atomically(follow, AGENT_B + "\n")  # the new lead
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        await settle(pilot, app, "plain assistant line")
+        for _ in range(100):  # the replaced `paseo logs` child is terminated, not orphaned
+            if not alive(old_pid):
+                break
+            await pilot.pause(0.05)
+        assert not alive(old_pid)
+        assert "plain assistant line" in log_text(app)
+    assert logs_agents(calls) == [AGENT_A, AGENT_B]
+    assert not any(c[0] == "send" for c in recorded(calls))
+
+
+async def test_follow_reading_the_same_id_again_does_not_reattach(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        write_atomically(follow, AGENT_A + "\n\n")
+        await pilot.pause(0.4)
+    assert logs_agents(calls) == [AGENT_A]
+
+
+async def test_follow_missing_file_waits_then_attaches_when_it_appears(follow, calls):
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "does not exist yet")
+        assert app.title == "waiting for an agent id"
+        assert logs_agents(calls) == []
+        write_atomically(follow, AGENT_B)
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        await settle(pilot, app, "plain assistant line")  # the stream starts after the title changes
+    assert logs_agents(calls) == [AGENT_B]
+
+
+@pytest.mark.parametrize(
+    ("content", "needle"),
+    [
+        ("", "is empty"),
+        ("  \n\n", "is empty"),
+        (AGENT_A + "\n" + AGENT_B + "\n", "does not hold a single agent id"),
+        ("two words\n", "does not hold a single agent id"),
+        ("--tail\n", "does not hold a single agent id"),
+        ("not/an/id\n", "does not hold a single agent id"),
+        ("aaaaaaa\n", "does not hold a single agent id"),  # a short id or prefix is refused: it could match another agent
+        (AGENT_A[:20] + "\n", "does not hold a single agent id"),  # a half-written id
+    ],
+)
+async def test_follow_unusable_file_is_noted_once_and_not_fatal(follow, calls, content, needle):
+    follow.write_text(content)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, needle)
+        await pilot.pause(0.3)  # several polls later the notice is still one line
+        assert log_text(app).count(needle) == 1
+        assert logs_agents(calls) == []
+        write_atomically(follow, AGENT_A)
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+
+
+async def test_follow_keeps_the_agent_when_the_file_goes_empty(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        follow.write_text("")  # a lead is mid-handoff: the file is briefly empty
+        await settle(pilot, app, "is empty")
+        assert app.title == "alpha (aaaaaaa)"
+        write_atomically(follow, AGENT_B)
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        await logs_seen(pilot, calls, AGENT_B)
+    assert logs_agents(calls) == [AGENT_A, AGENT_B]
+
+
+async def test_follow_unknown_id_waits_for_a_known_one(follow, calls):
+    follow.write_text("ccccccc9-0000-0000-0000-000000000009")
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "is not known to paseo")
+        await pilot.pause(0.5)  # several retries later the notice is still one line
+        assert log_text(app).count("is not known to paseo") == 1
+        assert logs_agents(calls) == []
+        write_atomically(follow, AGENT_A)
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+
+
+def test_follow_file_and_agent_are_mutually_exclusive(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["herdr4paseo", "aaaaaaa", "--follow-file", "/x/lead"])
+    with pytest.raises(SystemExit) as exc:
+        app_module.main()
+    assert exc.value.code == 2
+    assert "not allowed with" in capsys.readouterr().err
+    with pytest.raises(ValueError):
+        Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer", follow_file="/x/lead")
+
+
+def test_main_passes_follow_file_to_the_app(monkeypatch):
+    seen = {}
+
+    def fake_run(self):
+        seen.update(agent=self._ident, follow=self._follow_file)
+
+    monkeypatch.setattr(Herdr4PaseoApp, "run", fake_run)
+    monkeypatch.setattr("sys.argv", ["herdr4paseo", "--follow-file", "/x/lead"])
+    app_module.main()
+    assert seen == {"agent": None, "follow": "/x/lead"}
+
+
+async def test_follow_steady_id_does_not_call_ls_on_each_poll(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        before = len([c for c in recorded(calls) if c[0] == "ls"])
+        await pilot.pause(0.5)  # about ten polls of the file
+        after = len([c for c in recorded(calls) if c[0] == "ls"])
+    assert after == before  # the 3 s status poll has not fired yet; the follow loop asks nothing
+
+
+async def test_follow_notes_the_switch_and_marks_the_tab(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        assert app.sub_title.endswith("| follow")
+        write_atomically(follow, AGENT_B)
+        await settle(pilot, app, "switched from alpha (aaaaaaa) to beta (bbbbbbb)")
+        assert app.sub_title.endswith("| follow")
+
+
+async def test_follow_same_problem_is_noted_again_after_a_valid_read(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        follow.write_text("")
+        await settle(pilot, app, "is empty")
+        write_atomically(follow, AGENT_A)  # valid again, the agent already shown: nothing to switch
+        await pilot.pause(0.3)
+        follow.write_text("")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if log_text(app).count("is empty") == 2:
+                break
+        assert log_text(app).count("is empty") == 2
+    assert logs_agents(calls) == [AGENT_A]
+
+
+async def test_follow_switch_in_chat_view_attaches_the_new_agent(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+        await pilot.press("ctrl+v")  # chat view
+        await pilot.pause(0.3)
+        write_atomically(follow, AGENT_B)
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if [c[1] for c in recorded(calls) if c[0] == "logs" and "--json" in c][-1:] == [AGENT_B]:
+                break
+    assert [c[1] for c in recorded(calls) if c[0] == "logs" and "--json" in c][-1] == AGENT_B
+
+
+async def test_stop_dialog_open_during_a_switch_still_stops_the_agent_it_named(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.press("ctrl+x")
+        await pilot.pause(0.3)
+        assert type(app.screen).__name__ == "ConfirmStop"
+        write_atomically(follow, AGENT_B)  # the lead hands off while the dialog is open
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        assert type(app.screen).__name__ == "ConfirmStop"
+        await pilot.press("y")
+        await pilot.pause(0.5)
+    assert stop_calls(calls) == [["stop", AGENT_A]]  # never the newly followed agent
+
+
+async def test_permit_dialog_open_during_a_switch_answers_the_agent_it_listed(follow, calls, monkeypatch):
+    monkeypatch.setenv("FAKE_PASEO_PERMITS", PERMITS)
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    app.permit_clock = clock = FakeClock()
+    async with app.run_test() as pilot:
+        await banner_visible(pilot, app)
+        await pilot.press("ctrl+a")
+        await pilot.pause(0.3)
+        assert type(app.screen).__name__ == "ConfirmPermits"
+        write_atomically(follow, AGENT_B)
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        clock.now += app_module.ALLOW_DELAY_SECONDS
+        await pilot.press("y")
+        await pilot.pause(0.5)
+    assert permit_calls(calls) == [["permit", "allow", AGENT_A, "req11111-aaaa"]]
+
+
+async def test_status_poll_that_spans_a_switch_is_dropped(follow, calls, monkeypatch):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+        await settle(pilot, app, "plain assistant line")
+        real = app._probe_agent
+        spans = []
+
+        async def switching_probe(agent_id):
+            answer = await real(agent_id)  # A is "running" in this answer
+            if not spans:  # only the first probe spans the switch
+                spans.append(1)
+                write_atomically(follow, AGENT_B)  # the follow loop attaches B while this poll is in flight
+                await title_is(pilot, app, "beta (bbbbbbb)")
+            return answer
+
+        monkeypatch.setattr(app, "_probe_agent", switching_probe)
+        await app._refresh_status()
+        monkeypatch.setattr(app, "_probe_agent", real)
+        assert spans
+        assert app.title == "beta (bbbbbbb)"
+        assert app._last_status == "idle"  # B's own status, not A's "running" from the stale poll
+        assert app.sub_title.startswith("idle")
+
+
+@pytest.fixture
+def archived(monkeypatch):
+    """alpha is archived the way real paseo shows it: only `ls -a` lists it, and its status is `closed`."""
+    monkeypatch.setenv("FAKE_PASEO_ARCHIVED", "alpha")
+    monkeypatch.setenv("FAKE_PASEO_STATUS", "closed")
+
+
+async def test_follow_archived_agent_is_flagged_and_refuses_prompts(follow, calls, archived):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "is archived and")
+        assert "names no other agent" in log_text(app)
+        await pilot.press(*"hello", "enter")
+        await settle(pilot, app, "not sent")
+        assert app.query_one("#prompt", PromptArea).text == "hello"  # the text is kept
+    assert not any(c[0] == "send" for c in recorded(calls))
+
+
+async def test_follow_archived_check_happens_at_send_time(follow, calls, monkeypatch):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        monkeypatch.setenv("FAKE_PASEO_ARCHIVED", "alpha")  # archived after the tab attached, before the next poll
+        await pilot.press(*"late", "enter")
+        await settle(pilot, app, "not sent")
+    assert not any(c[0] == "send" for c in recorded(calls))
+
+
+async def test_follow_live_agent_still_gets_prompts(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        assert "archived" not in log_text(app)
+        await pilot.press(*"hello", "enter")
+        await pilot.pause(0.5)
+    assert any(c[0] == "send" and c[-1] == "hello" for c in recorded(calls))
+
+
+async def test_follow_prompts_fail_closed_when_archival_cannot_be_checked(follow, calls, monkeypatch):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        monkeypatch.setenv("FAKE_PASEO_LS_PLAIN_FAIL", "1")
+        await pilot.press(*"hello", "enter")
+        await settle(pilot, app, "could not be checked for archival")
+    assert not any(c[0] == "send" for c in recorded(calls))
+
+
+async def test_archived_agent_still_accepts_prompts_without_follow_file(calls, archived):
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await pilot.pause(0.5)
+        await pilot.press(*"hello", "enter")
+        await pilot.pause(0.5)
+    assert any(c[0] == "send" for c in recorded(calls))  # existing behaviour is unchanged
+
+
+async def test_follow_switch_clears_the_old_agents_permits_when_permit_ls_fails(follow, calls, monkeypatch, tmp_path):
+    flag = tmp_path / "permits-fail"
+    monkeypatch.setenv("FAKE_PASEO_PERMITS", PERMITS)
+    monkeypatch.setenv("FAKE_PASEO_PERMITS_FAIL_FILE", str(flag))
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await banner_visible(pilot, app)
+        assert app.permits
+        flag.touch()  # the daemon is busy from now on
+        write_atomically(follow, AGENT_B)
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        await pilot.pause(0.3)
+        assert app.permits == []  # A's requests are not kept under B's title
+        assert app.query_one("#permits").has_class("hidden")
+        await pilot.press("ctrl+a")  # no pending requests: this is the prompt's own line-start key
+        await pilot.pause(0.3)
+        assert type(app.screen).__name__ != "ConfirmPermits"
+    assert permit_calls(calls) == []
+
+
+async def test_follow_fifo_does_not_block_the_loop(follow, calls):
+    os.mkfifo(follow)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "not a regular file")
+        follow.unlink()
+        follow.write_text(AGENT_A)
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+
+
 
 
 # -- status polling (poll.py): one cheap probe per tick, `permit ls` only when something waits ----
