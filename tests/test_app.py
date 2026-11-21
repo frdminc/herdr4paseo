@@ -29,6 +29,10 @@ def calls(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR4PASEO_HISTORY", str(tmp_path / "history.json"))
     monkeypatch.delenv("FAKE_PASEO_SEND_FAIL", raising=False)
     monkeypatch.delenv("FAKE_PASEO_LOGS_EXIT", raising=False)
+    monkeypatch.delenv("FAKE_PASEO_LOG_LATE", raising=False)
+    monkeypatch.delenv("FAKE_PASEO_LOG_DELAY", raising=False)
+    monkeypatch.delenv("FAKE_PASEO_INSPECT_FAIL", raising=False)
+    monkeypatch.delenv("FAKE_PASEO_INSPECT_SLEEP_A", raising=False)
     monkeypatch.delenv("FAKE_PASEO_RUN_FAIL", raising=False)
     monkeypatch.delenv("FAKE_PASEO_STATUS", raising=False)
     return path
@@ -410,7 +414,8 @@ async def test_stream_end_reconnects(calls, monkeypatch):
 
 
 async def test_idle_transition_rings_and_notes(calls, monkeypatch):
-    monkeypatch.setattr("herdr4paseo.app.STATUS_POLL_SECONDS", 0.1)
+    for name in ("ACTIVE", "IDLE", "IDLE_MAX", "FAST"):
+        monkeypatch.setenv(f"HERDR4PASEO_POLL_{name}", "0.5")
     rings = []
     app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
     monkeypatch.setattr(app, "bell", lambda: rings.append(1))
@@ -1293,22 +1298,21 @@ async def test_status_poll_that_spans_a_switch_is_dropped(follow, calls, monkeyp
     async with app.run_test() as pilot:
         await title_is(pilot, app, "alpha (aaaaaaa)")
         await settle(pilot, app, "plain assistant line")
-        real = app._list_agents
-
+        real = app._probe_agent
         spans = []
 
-        async def switching_list():
-            agents = await real()  # A is "running" in this answer
-            if spans:  # only the status poll's call spans the switch; the follow loop's own call passes through
-                return agents
-            spans.append(1)
-            write_atomically(follow, AGENT_B)  # the follow loop attaches B while this poll is in flight
-            await title_is(pilot, app, "beta (bbbbbbb)")
-            return agents
+        async def switching_probe(agent_id):
+            answer = await real(agent_id)  # A is "running" in this answer
+            if not spans:  # only the first probe spans the switch
+                spans.append(1)
+                write_atomically(follow, AGENT_B)  # the follow loop attaches B while this poll is in flight
+                await title_is(pilot, app, "beta (bbbbbbb)")
+            return answer
 
-        monkeypatch.setattr(app, "_list_agents", switching_list)
+        monkeypatch.setattr(app, "_probe_agent", switching_probe)
         await app._refresh_status()
-        monkeypatch.setattr(app, "_list_agents", real)
+        monkeypatch.setattr(app, "_probe_agent", real)
+        assert spans
         assert app.title == "beta (bbbbbbb)"
         assert app._last_status == "idle"  # B's own status, not A's "running" from the stale poll
         assert app.sub_title.startswith("idle")
@@ -1404,3 +1408,159 @@ async def test_follow_fifo_does_not_block_the_loop(follow, calls):
         follow.unlink()
         follow.write_text(AGENT_A)
         await title_is(pilot, app, "alpha (aaaaaaa)")
+
+
+
+
+# -- status polling (poll.py): one cheap probe per tick, `permit ls` only when something waits ----
+
+
+def fast_polls(monkeypatch, **extra):
+    for name in ("ACTIVE", "IDLE", "IDLE_MAX", "FAST", "BURST"):
+        monkeypatch.setenv(f"HERDR4PASEO_POLL_{name}", "0.5")
+    for name, value in extra.items():
+        monkeypatch.setenv(f"HERDR4PASEO_POLL_{name}", value)
+
+
+async def wait_for_calls(pilot, calls, predicate) -> None:
+    for _ in range(200):
+        await pilot.pause(0.05)
+        if predicate(recorded(calls)):
+            return
+    raise AssertionError(f"calls never matched; saw {recorded(calls)}")
+
+
+async def test_polls_probe_one_agent_and_skip_permit_ls_when_nothing_pends(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await wait_for_calls(pilot, calls, lambda c: sum(x[:2] == ["agent", "inspect"] for x in c) >= 3)
+    rec = recorded(calls)
+    assert rec[0] == ["ls", "-g", "-a", "--json"]  # attaching lists once
+    assert sum(c[:2] == ["ls", "-g"] for c in rec) == 1  # polling never lists every agent again
+    assert sum(c[:2] == ["permit", "ls"] for c in rec) == 1  # only the attach looked
+    assert ["agent", "inspect", "aaaaaaa1-0000-0000-0000-000000000001", "--json"] in rec
+
+
+async def test_pending_request_runs_permit_ls_and_shows_the_banner(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        permits = [{"id": "p1", "agentId": AGENT_A, "agentShortId": "aaaaaaa", "name": "Bash", "description": "ls"}]
+        monkeypatch.setenv("FAKE_PASEO_PERMITS", json.dumps(permits))
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if [p.id for p in app.permits] == ["p1"]:
+                break
+        assert [p.id for p in app.permits] == ["p1"]
+        assert not app.query_one("#permits").has_class("hidden")
+        monkeypatch.setenv("FAKE_PASEO_PERMITS", "[]")  # answered in the Paseo app
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if not app.permits:
+                break
+        assert app.permits == []
+        assert app.query_one("#permits").has_class("hidden")
+
+
+async def test_idle_agent_backs_off_between_probes(calls, monkeypatch):
+    fast_polls(monkeypatch, IDLE="0.4", IDLE_MAX="1.6", FAST="0.4", BURST="0.4", ACTIVE="0.4")
+    monkeypatch.setenv("FAKE_PASEO_STATUS", "idle")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await pilot.pause(3.0)
+    probes = sum(c[:2] == ["agent", "inspect"] for c in recorded(calls))
+    assert 2 <= probes <= 4, probes  # a flat 0.5 s tick would have made ~6
+
+
+async def test_poll_falls_back_to_ls_when_inspect_fails(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    monkeypatch.setenv("FAKE_PASEO_INSPECT_FAIL", "1")
+    rings = []
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    monkeypatch.setattr(app, "bell", lambda: rings.append(1))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        monkeypatch.setenv("FAKE_PASEO_STATUS", "idle")
+        await settle(pilot, app, "alert: agent idle")  # still noticed, through the old ls path
+    rec = recorded(calls)
+    assert sum(c[:2] == ["ls", "-g"] for c in rec) >= 2 and rings
+
+
+async def test_log_output_wakes_a_backed_off_idle_agent(calls, monkeypatch):
+    fast_polls(monkeypatch, IDLE="30", IDLE_MAX="30", ACTIVE="30", FAST="0.5", BURST="0.5")
+    monkeypatch.setenv("FAKE_PASEO_STATUS", "idle")
+    monkeypatch.setenv("FAKE_PASEO_LOG_LATE", "1.3")  # new output after the replayed tail
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+
+    def probes() -> int:
+        return sum(c[:2] == ["agent", "inspect"] for c in recorded(calls))
+
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        await pilot.pause(3.0)  # the attach burst ends and the first stream's late line has been seen; the next scheduled poll is 30 s away
+        before = probes()
+        await pilot.pause(1.0)
+        assert probes() == before  # really backed off
+        await pilot.press("ctrl+o")  # restarts the log stream: fresh output reaches the app
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if probes() > before:
+                break
+        assert probes() > before  # woken by the late output, not by the 30 s timer
+
+
+async def test_a_probe_in_flight_for_the_old_agent_never_clears_the_new_agents_banner(calls, monkeypatch):
+    fast_polls(monkeypatch, ACTIVE="30", IDLE="30", IDLE_MAX="30", FAST="0.5", BURST="0.5")
+    agent_b = "bbbbbbb2-0000-0000-0000-000000000002"
+    permits = [{"id": "pb", "agentId": agent_b, "agentShortId": "bbbbbbb", "name": "Bash", "description": "ls"}]
+    monkeypatch.setenv("FAKE_PASEO_PERMITS", json.dumps(permits))
+    monkeypatch.setenv("FAKE_PASEO_INSPECT_SLEEP_A", "1.5")
+    shown = []
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    original = app._show_permits
+    monkeypatch.setattr(app, "_show_permits", lambda p: (shown.append([x.id for x in p]), original(p))[1])
+    async with app.run_test() as pilot:
+        await wait_for_calls(pilot, calls, lambda c: any(x[:2] == ["agent", "inspect"] for x in c))  # alpha's slow probe is running
+        app._choose_agent("bbbbbbb")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if [p.id for p in app.permits] == ["pb"]:
+                break
+        assert [p.id for p in app.permits] == ["pb"]
+        shown.clear()
+        await pilot.pause(2.0)  # alpha's probe returns "nothing pending" in here
+        assert [] not in shown
+        assert [p.id for p in app.permits] == ["pb"]
+
+
+async def test_a_stream_that_keeps_ending_does_not_keep_the_poll_fast(calls, monkeypatch):
+    fast_polls(monkeypatch, IDLE="30", IDLE_MAX="30", ACTIVE="30", FAST="0.5", BURST="0.5")
+    monkeypatch.setattr("herdr4paseo.app.RECONNECT_SECONDS", 0.1)
+    monkeypatch.setenv("FAKE_PASEO_STATUS", "idle")
+    monkeypatch.setenv("FAKE_PASEO_LOGS_EXIT", "1")  # prints the replayed tail and exits, over and over
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await pilot.pause(3.0)
+        app.workers.cancel_group(app, "stream")  # stop the reattach loop before teardown
+        await pilot.pause(0.3)
+    rec = recorded(calls)
+    assert sum(c[0] == "logs" for c in rec) >= 5  # the stream really did reattach again and again
+    assert sum(c[:2] == ["agent", "inspect"] for c in rec) <= 3  # replayed lines are not wake-ups
+
+
+async def test_a_slow_logs_start_does_not_turn_its_replay_into_a_wake_up(calls, monkeypatch):
+    fast_polls(monkeypatch, IDLE="30", IDLE_MAX="30", ACTIVE="30", FAST="0.5", BURST="0.5")
+    monkeypatch.setattr("herdr4paseo.app.RECONNECT_SECONDS", 0.1)
+    monkeypatch.setenv("FAKE_PASEO_STATUS", "idle")
+    monkeypatch.setenv("FAKE_PASEO_LOGS_EXIT", "1")
+    monkeypatch.setenv("FAKE_PASEO_LOG_DELAY", "1.2")  # the tail arrives long after spawn, then the stream ends
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await pilot.pause(4.5)
+        app.workers.cancel_group(app, "stream")
+        await pilot.pause(0.3)
+    rec = recorded(calls)
+    assert sum(c[0] == "logs" for c in rec) >= 3
+    assert sum(c[:2] == ["agent", "inspect"] for c in rec) <= 2

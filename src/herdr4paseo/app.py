@@ -73,14 +73,15 @@ from .core import (
     style_for,
 )
 from .daemon import DaemonError, fetch_commands
+from .poll import PollConfig, PollSchedule, inspect_argv, parse_inspect
 
-STATUS_POLL_SECONDS = 3.0
 FOLLOW_POLL_SECONDS = 1.0  # --follow-file: how often the file is read (a small local read)
 FOLLOW_RETRY_SECONDS = 3.0  # --follow-file: pause before asking `paseo ls` again about an id it could not find
 MAX_LOG_LINES = 20_000  # per RichLog: older lines scroll off instead of growing memory forever
 RENDER_BUDGET_CHARS = 512_000  # newest items rendered per chat redraw; older ones show as a count
 RENDER_SECONDS = 0.1  # at most ~10 chat re-renders a second however fast records arrive
 RECONNECT_SECONDS = 3.0
+STREAM_SETTLE_SECONDS = 1.0  # log output this soon after an attach's first line is replay or an error, not a wake-up
 # `y` in an ALLOW dialog is ignored (bell) for this long after the dialog mounts, so a fast
 # repeated Ctrl+A, y cannot approve a request that was on screen for only a split second.
 ALLOW_DELAY_SECONDS = 0.5
@@ -358,6 +359,11 @@ class Herdr4PaseoApp(App[None]):
         self.commands: list[Command] = []
         self.slash_matches: list[Command] = []
         self._slash_idx = 0
+        self._poll = PollSchedule(PollConfig.from_env())  # status polling cadence (poll.py)
+        self._poll_timer = None
+        self._poll_due = 0.0
+        self._stream_up_at: float | None = None  # when the current attach delivered its first line
+        self._polling = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -375,7 +381,7 @@ class Herdr4PaseoApp(App[None]):
         prompt = self.query_one("#prompt", PromptArea)
         prompt.slash_handler = self.handle_slash_key
         prompt.focus()
-        self.set_interval(STATUS_POLL_SECONDS, self._refresh_status)
+        self._arm_poll()
         if self._follow_file:
             self.title = "waiting for an agent id"
             self.sub_title = sanitize_line(f"following {self._follow_file}")
@@ -417,10 +423,9 @@ class Herdr4PaseoApp(App[None]):
         """Show `picked`. The log, chat and command workers are exclusive, so the old agent's `paseo logs` child is ended."""
         archived = await self._followed_archived(picked) if self._follow_file else False
         previous, self.agent = self.agent, picked
-        self.permits = []  # never keep the previous agent's requests under the new title
-        with contextlib.suppress(NoMatches, ScreenStackError):  # both mean the app is shutting down
-            self.refresh_bindings()
-            self.query_one("#permits", Static).add_class("hidden")
+        self._poll = PollSchedule(self._poll.config)  # a new agent starts a fresh schedule
+        self._wake_poll()
+        self._show_permits([])  # never keep the previous agent's requests under the new title
         self._last_status = picked.status
         self.title = sanitize_line(f"{picked.name} ({picked.short_id})")
         self._update_subtitle(picked.status)
@@ -490,34 +495,84 @@ class Herdr4PaseoApp(App[None]):
         self._followed, self._follow_unknown = ident, None
         await self._attach(agent)
 
+    def _arm_poll(self, delay: float | None = None) -> None:
+        """(Re)start the one-shot poll timer; delay defaults to the schedule's next interval."""
+        if not self.is_running:
+            return
+        if self._poll_timer is not None:
+            self._poll_timer.stop()
+        delay = self._poll.delay() if delay is None else delay
+        self._poll_due = time.monotonic() + delay
+        self._poll_timer = self.set_timer(delay, self._poll_tick)
+
+    def _wake_poll(self) -> None:
+        """Poll sooner if the schedule now says so (never later); a poll in flight re-arms itself."""
+        if not self._polling and time.monotonic() + self._poll.delay() < self._poll_due:
+            self._arm_poll()
+
+    async def _poll_tick(self) -> None:
+        self._poll_timer, self._polling = None, True
+        try:
+            await self._refresh_status()
+        finally:
+            self._polling = False
+            self._arm_poll()
+
+    def _bump_poll(self) -> None:
+        """A user action probably changed the agent: poll fast for a while."""
+        self._poll.bump()
+        self._wake_poll()
+
+    async def _probe_agent(self, agent_id: str) -> tuple[str, bool] | None:
+        """(status, request pending) from one `paseo agent inspect`; None sends the caller to `paseo ls`."""
+        code, out, _err = await run_paseo(inspect_argv(agent_id))
+        if code != 0:
+            return None
+        try:
+            return parse_inspect(out, agent_id)
+        except (ValueError, TypeError, AttributeError):
+            return None
+
     async def _refresh_status(self) -> None:
         agent = self.agent
         if agent is None:
             return
-        before = len(self.permits)
-        current = find_agent(await self._list_agents(), agent.id)
-        if self.agent is not agent:  # the shown agent changed during the call: this answer is stale
+        agent_id, before = self.agent.id, len(self.permits)
+        agent = self.agent
+        probe = await self._probe_agent(agent_id)
+        if self.agent is None or self.agent.id != agent_id:
+            return  # switched agent during the probe: its answer must not touch the new agent's banner
+        if probe is not None:
+            status, pending = probe
+            if pending:
+                await self._refresh_permits()  # the labels come from `permit ls`; run only when one waits
+            elif self.permits:
+                self._show_permits([])  # answered elsewhere
+        else:  # old paseo or an odd answer: the full listing plus `permit ls`, as before
+            pending = False
+            current = find_agent(await self._list_agents(), agent_id)
+            status = current.status if current is not None else None
+            await self._refresh_permits()
+        if self.agent is None or self.agent.id != agent_id:
+            return  # switched agent during the poll
+        if self._follow_file:  # follow mode: a followed agent can be archived (see _followed_archived)
+            archived = await self._followed_archived(agent)
+            if self.agent is not agent:
+                return
+            if not archived:
+                self._archived_noted = None
+            elif self._archived_noted != agent.id:
+                self._archived_noted = agent.id
+                self._note(self._archived_text(agent), "error.text")
+        if status is None:
             return
-        if current is not None:
-            self._update_subtitle(current.status)
-            if self._follow_file:
-                archived = await self._followed_archived(current)
-                if self.agent is not agent:
-                    return
-                if not archived:
-                    self._archived_noted = None
-                elif self._archived_noted != current.id:
-                    self._archived_noted = current.id
-                    self._note(self._archived_text(current), "error.text")
-        await self._refresh_permits()
-        if self.agent is not agent:
-            return
-        if current is not None:
-            reason = should_alert(self._last_status, current.status, before, len(self.permits))
-            self._last_status = current.status
-            if reason:
-                self.bell()
-                self._note(f"alert: {reason}", "permission")
+        self._update_subtitle(status)
+        self._poll.observe(status, len(self.permits) or int(pending))
+        reason = should_alert(self._last_status, status, before, len(self.permits))
+        self._last_status = status
+        if reason:
+            self.bell()
+            self._note(f"alert: {reason}", "permission")
 
     async def _refresh_permits(self) -> None:
         """Poll pending permission requests for the shown agent and update the banner."""
@@ -528,9 +583,13 @@ class Herdr4PaseoApp(App[None]):
         if code != 0 or self.agent is not agent:
             return  # keep the last banner; a transient failure must not hide a pending request
         try:
-            self.permits = parse_permissions(out, agent.id)
+            permits = parse_permissions(out, agent.id)
         except (ValueError, TypeError, AttributeError):
             return
+        self._show_permits(permits)
+
+    def _show_permits(self, permits: list[Permission]) -> None:
+        self.permits = permits
         try:
             self.refresh_bindings()
             banner = self.query_one("#permits", Static)
@@ -598,6 +657,7 @@ class Herdr4PaseoApp(App[None]):
                 self._note(f"cannot run paseo: {exc.strerror or exc}; retrying in {RECONNECT_SECONDS:g}s", "error.text")
                 await asyncio.sleep(RECONNECT_SECONDS)
                 continue
+            self._stream_up_at = None
             try:
                 assert proc.stdout is not None
                 async for line in iter_record_lines(proc.stdout, MAX_LOG_LINE_BYTES):
@@ -605,6 +665,7 @@ class Herdr4PaseoApp(App[None]):
                         self._note(f"skipped a log line over {MAX_LOG_LINE_BYTES >> 10} KiB", "error.text")
                         continue
                     log.write(styler.style(line.decode(errors="replace").rstrip("\n")))
+                    self._log_activity()
                 rc = await proc.wait()
             finally:
                 if proc.returncode is None:
@@ -617,6 +678,7 @@ class Herdr4PaseoApp(App[None]):
     def _apply_timeline(self, raw: str) -> None:
         """Fold records into the timeline now; the visible re-render is coalesced (RENDER_SECONDS)."""
         # an envelope can hold thousands of items: only the newest ones can survive the trim anyway
+        self._log_activity()
         for item in parse_timeline(raw)[-MAX_TIMELINE_ITEMS:]:
             self._open_chain = apply_timeline_item(self.timeline, item, self._open_chain)
         self._open_chain, dropped = trim_timeline(self.timeline, self._open_chain)
@@ -696,6 +758,7 @@ class Herdr4PaseoApp(App[None]):
                     self._note("skipped a stderr line over %d KiB" % (MAX_LOG_LINE_BYTES >> 10) if line is None
                                else line.decode(errors="replace").rstrip(), "meta")
             reader = asyncio.create_task(notices())
+            self._stream_up_at = None
             try:
                 assert proc.stdout is not None
                 async for line in iter_record_lines(proc.stdout, MAX_RECORD_BYTES):
@@ -715,6 +778,16 @@ class Herdr4PaseoApp(App[None]):
                 await reader
             self._note("chat stream ended; reconnecting", "meta")
             await asyncio.sleep(RECONNECT_SECONDS)
+
+    def _log_activity(self) -> None:
+        # the first second after an attach's first line is its replayed tail or a failure notice, not new output
+        now = time.monotonic()
+        if self._stream_up_at is None:
+            self._stream_up_at = now
+        if now - self._stream_up_at < STREAM_SETTLE_SECONDS:
+            return
+        if self._poll.log_activity():  # a settled agent is producing output: look now, not in a minute
+            self._wake_poll()
 
     # -- slash commands -------------------------------------------------------------
 
@@ -790,6 +863,7 @@ class Herdr4PaseoApp(App[None]):
         if code != 0:
             self._note(f"send failed (rc={code}): {err.strip()}", "error.text")
             return  # keep the text so nothing typed is lost
+        self._bump_poll()
         self._history.append(text)
         self._history_pos = len(self._history)
         save_history(history_path(), self._history)
@@ -839,6 +913,7 @@ class Herdr4PaseoApp(App[None]):
             result = "ok" if code == 0 else f"failed (rc={code}): {err.strip()}"
             self._note(f"permit {decision} {permit.label}: {result}", "success" if code == 0 else "error.text")
         await self._refresh_permits()
+        self._bump_poll()
 
     @work(exclusive=True, group="new")  # push_screen_wait only runs inside a worker
     async def action_new_agent(self) -> None:
@@ -865,6 +940,7 @@ class Herdr4PaseoApp(App[None]):
             return
         code, _out, err = await run_paseo(stop_argv(target.id))
         if code == 0:
+            self._bump_poll()
             self._note(f"stopped {target.name}", "status")
         else:
             self._note(f"stop failed (rc={code}): {err.strip()}", "error.text")
