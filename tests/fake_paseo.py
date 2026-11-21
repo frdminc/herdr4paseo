@@ -13,6 +13,16 @@ AGENTS = [
      "provider": "codex/y", "status": "idle", "cwd": "~/src/b", "created": "2 days ago"},
 ]
 
+
+def pending_permits() -> str:
+    out = os.environ.get("FAKE_PASEO_PERMITS", "[]")
+    if os.environ.get("FAKE_PASEO_PERMITS_STATEFUL"):  # an answered request leaves the list, as in the real daemon
+        with open(os.environ["FAKE_PASEO_CALLS"]) as seen:
+            answered = {c[3] for c in map(json.loads, seen) if c[:2] in (["permit", "allow"], ["permit", "deny"]) and len(c) > 3}
+        out = json.dumps([q for q in json.loads(out) if q["id"] not in answered])
+    return out
+
+
 with open(os.environ["FAKE_PASEO_CALLS"], "a") as calls:
     calls.write(json.dumps(sys.argv[1:]) + "\n")
 
@@ -87,12 +97,15 @@ elif cmd == "logs":
         sys.exit(0)
     time.sleep(30)  # `-f` follows until killed
 elif cmd == "permit" and sys.argv[2] == "ls":
-    out = os.environ.get("FAKE_PASEO_PERMITS", "[]")
-    if os.environ.get("FAKE_PASEO_PERMITS_STATEFUL"):  # an answered request leaves the list, as in the real daemon
-        with open(os.environ["FAKE_PASEO_CALLS"]) as seen:
-            answered = {c[3] for c in map(json.loads, seen) if c[:2] in (["permit", "allow"], ["permit", "deny"]) and len(c) > 3}
-        out = json.dumps([q for q in json.loads(out) if q["id"] not in answered])
-    print(out)
+    print(pending_permits())
+elif cmd == "agent" and sys.argv[2] == "inspect":  # one agent, capitalised keys, as the real CLI prints it
+    if os.environ.get("FAKE_PASEO_INSPECT_FAIL"):
+        print("unknown command", file=sys.stderr)
+        sys.exit(1)
+    agent = next(a for a in AGENTS if a["id"] == sys.argv[3])
+    queue = [q for q in json.loads(pending_permits()) if q["agentId"] == agent["id"]]
+    print(json.dumps({"Id": agent["id"], "Name": agent["name"], "Status": agent["status"],
+                      "PendingPermissions": [{"id": q["id"], "tool": q["name"]} for q in queue]}, indent=2))
 elif cmd == "run":
     if os.environ.get("FAKE_PASEO_RUN_FAIL"):
         print("no provider", file=sys.stderr)

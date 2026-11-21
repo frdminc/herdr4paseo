@@ -6,7 +6,7 @@ This page walks through the jobs the tool is for. For the key table and options 
 
 1. Start or find an agent in Paseo. `paseo ls -g -a` lists every agent, archived ones included, with its short id.
 2. In a Herdr pane, run `herdr4paseo 7dba08f` (your id). The last 50 log entries appear, then new entries stream in live.
-3. The header shows the agent's status. It refreshes every 3 seconds.
+3. The header shows the agent's status. It refreshes every 5 s while the agent runs and every 15 to 60 s while it is idle (see the README's Polling section).
 4. Quit with Ctrl+Q, or type `/quit` or `/exit` and press Enter (these are handled by herdr4paseo and never sent to the agent). You return to the shell you launched it from, and the agent is not touched. Run the command again, or press Ctrl+L inside it, to reattach.
 
 Use `--tail 300` to see more history on attach. Press Ctrl+O to show only tool calls, which makes a long run easier to skim; press it again to return to the full log.

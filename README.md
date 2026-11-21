@@ -66,7 +66,7 @@ Find an agent id with `paseo ls -g -a`. Type a prompt and press Enter to send it
 | Ctrl+A, Ctrl+D | Allow or deny the agent's pending permission requests (only active while some are pending; asks to confirm) |
 | Ctrl+Q, or `/quit` / `/exit` typed in the prompt | Quit back to the shell (the agent keeps running). The two typed commands are handled here and never sent to the agent, so they shadow an agent's own `/quit` or `/exit` |
 
-The header shows the agent's status (polled every 3 s), the send behaviour and the log view. A failed send keeps your text in the box and prints the error in the log.
+The header shows the agent's status (polled adaptively, see [Polling](#polling)), the send behaviour and the log view. A failed send keeps your text in the box and prints the error in the log.
 
 The terminal bell rings, with a yellow `alert:` line in the log, when the shown agent goes from running to idle or a new permission request appears. If the log stream ends (for example the daemon restarts), it reattaches by itself every 3 s.
 
@@ -78,12 +78,25 @@ The terminal bell rings, with a yellow `alert:` line in the log, when the shown 
 | `HERDR4PASEO_HISTORY` | Path of the prompt-history file (default `~/.local/state/herdr4paseo/history.json`, the last 200 prompts, shared by all agents). |
 | `PASEO_BIN` | Path to the `paseo` executable to run (default `paseo`). The tests point it at a fake. |
 | `NO_COLOR` | Turns colour off (bold, italic and dim stay). Textual treats an empty `NO_COLOR=` as set too, which is stricter than [no-color.org](https://no-color.org). See [Colours](docs/usage.md#colours). |
+| `HERDR4PASEO_POLL_ACTIVE`, `_IDLE`, `_IDLE_MAX`, `_FAST`, `_BURST` | Status-poll intervals in seconds (defaults 5, 15, 60, 3, 15; minimum 0.5). See [Polling](#polling). |
 | `TEXTUAL_COLOR_SYSTEM` | Force the colour depth: `auto` (default), `standard` (16 colours), `256` or `truecolor`. |
+
+## Polling
+
+Each status poll starts a `paseo` Node process, so the schedule is deliberately lazy. One poll runs `paseo agent inspect <id> --json` (one agent: status and pending permission requests) and runs `paseo permit ls --json` only when that reports a pending request. `paseo ls` runs when attaching or switching, and as a fallback when `inspect` fails.
+
+| Situation | Interval | Variable |
+| --- | --- | --- |
+| Agent running, or a request pending | 5 s | `HERDR4PASEO_POLL_ACTIVE` |
+| Agent not running | 15 s, doubling while nothing changes, up to 60 s | `HERDR4PASEO_POLL_IDLE`, `HERDR4PASEO_POLL_IDLE_MAX` |
+| For `HERDR4PASEO_POLL_BURST` (15 s) after attaching, sending, answering a request, stopping, or an observed change | 3 s | `HERDR4PASEO_POLL_FAST`, `HERDR4PASEO_POLL_BURST` |
+
+A permission request can only arise while a turn is running, so the 5 s rate while running bounds how late the banner and bell appear (about 5 s, plus the probe's own run time). A settled agent that starts producing log output is polled at once (at most once per idle interval), so waking up in the Paseo app is noticed in seconds, not after a 60 s back-off. Before this schedule every instance ran `paseo ls -g -a --json` (a listing of every agent, about 1 MB) and `paseo permit ls --json` every 3 s.
 
 ## Limits
 
 1. It is a log view, not the agent's own TUI: no PTY features. Slash commands work because `paseo send` passes `/context`, `/compact` and skills such as `/steps` through to the provider. The Paseo app's own commands (for example `/exit`) are client-side in Paseo and do not exist here.
-2. Permission requests: a banner lists the shown agent's pending requests (polled every 3 s). Ctrl+A or Ctrl+D opens a confirmation listing them; `y` answers each listed request by id with `paseo permit allow|deny`, so a request that arrives after you looked is never approved blind. In an allow confirmation `y` is ignored (the terminal bell rings) for the first half second after it opens, so a fast repeated Ctrl+A, `y` cannot approve a request you only glimpsed; deny is not delayed. While none are pending, Ctrl+A and Ctrl+D keep their prompt-editing meaning (line start, delete).
+2. Permission requests: a banner lists the shown agent's pending requests (a new one appears within about 5 s, see [Polling](#polling)). Ctrl+A or Ctrl+D opens a confirmation listing them; `y` answers each listed request by id with `paseo permit allow|deny`, so a request that arrives after you looked is never approved blind. In an allow confirmation `y` is ignored (the terminal bell rings) for the first half second after it opens, so a fast repeated Ctrl+A, `y` cannot approve a request you only glimpsed; deny is not delayed. While none are pending, Ctrl+A and Ctrl+D keep their prompt-editing meaning (line start, delete).
 3. Slash suggestions come from the daemon's `list_commands_request`, the one request the `paseo` CLI does not expose, over its local WebSocket. It is read-only. The daemon's local credential is read from `$PASEO_HOME/local-credential` and sent only to a loopback daemon. A remote daemon that needs a password gets no suggestions; typed commands still send.
 4. Log colouring is line by line from what `paseo logs` prints: the `[Tag]` prefix, continuation lines of `[User]` and `[Thought]` entries, markdown, diff and code fences in assistant text. `paseo logs` does not tag assistant text, so a multi-line `[User]` prompt followed directly by assistant text shows that text in the user colour until the next tag. It prints no tool results or diffs, so those cannot be coloured. Details: [Colours](docs/usage.md#colours).
 5. `paseo send` text beginning with `-` gets one leading space so the CLI does not read it as a flag.

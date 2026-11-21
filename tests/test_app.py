@@ -406,7 +406,8 @@ async def test_stream_end_reconnects(calls, monkeypatch):
 
 
 async def test_idle_transition_rings_and_notes(calls, monkeypatch):
-    monkeypatch.setattr("herdr4paseo.app.STATUS_POLL_SECONDS", 0.1)
+    for name in ("ACTIVE", "IDLE", "IDLE_MAX", "FAST"):
+        monkeypatch.setenv(f"HERDR4PASEO_POLL_{name}", "0.5")
     rings = []
     app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
     monkeypatch.setattr(app, "bell", lambda: rings.append(1))
@@ -1015,3 +1016,79 @@ async def test_allow_dialog_fits_an_80x24_screen_with_wide_text(calls, monkeypat
         assert "[y] yes" in text and box.region.bottom <= 24 and box.region.y >= 0, (box.region, text[-80:])
         assert "evil.example" not in text
         await pilot.press("n")
+
+
+# -- status polling (poll.py): one cheap probe per tick, `permit ls` only when something waits ----
+
+
+def fast_polls(monkeypatch, **extra):
+    for name in ("ACTIVE", "IDLE", "IDLE_MAX", "FAST", "BURST"):
+        monkeypatch.setenv(f"HERDR4PASEO_POLL_{name}", "0.5")
+    for name, value in extra.items():
+        monkeypatch.setenv(f"HERDR4PASEO_POLL_{name}", value)
+
+
+async def wait_for_calls(pilot, calls, predicate) -> None:
+    for _ in range(200):
+        await pilot.pause(0.05)
+        if predicate(recorded(calls)):
+            return
+    raise AssertionError(f"calls never matched; saw {recorded(calls)}")
+
+
+async def test_polls_probe_one_agent_and_skip_permit_ls_when_nothing_pends(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await wait_for_calls(pilot, calls, lambda c: sum(x[:2] == ["agent", "inspect"] for x in c) >= 3)
+    rec = recorded(calls)
+    assert rec[0] == ["ls", "-g", "-a", "--json"]  # attaching lists once
+    assert sum(c[:2] == ["ls", "-g"] for c in rec) == 1  # polling never lists every agent again
+    assert sum(c[:2] == ["permit", "ls"] for c in rec) == 1  # only the attach looked
+    assert ["agent", "inspect", "aaaaaaa1-0000-0000-0000-000000000001", "--json"] in rec
+
+
+async def test_pending_request_runs_permit_ls_and_shows_the_banner(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        permits = [{"id": "p1", "agentId": AGENT_A, "agentShortId": "aaaaaaa", "name": "Bash", "description": "ls"}]
+        monkeypatch.setenv("FAKE_PASEO_PERMITS", json.dumps(permits))
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if [p.id for p in app.permits] == ["p1"]:
+                break
+        assert [p.id for p in app.permits] == ["p1"]
+        assert not app.query_one("#permits").has_class("hidden")
+        monkeypatch.setenv("FAKE_PASEO_PERMITS", "[]")  # answered in the Paseo app
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if not app.permits:
+                break
+        assert app.permits == []
+        assert app.query_one("#permits").has_class("hidden")
+
+
+async def test_idle_agent_backs_off_between_probes(calls, monkeypatch):
+    fast_polls(monkeypatch, IDLE="0.4", IDLE_MAX="1.6", FAST="0.4", BURST="0.4", ACTIVE="0.4")
+    monkeypatch.setenv("FAKE_PASEO_STATUS", "idle")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await pilot.pause(3.0)
+    probes = sum(c[:2] == ["agent", "inspect"] for c in recorded(calls))
+    assert 2 <= probes <= 4, probes  # a flat 0.5 s tick would have made ~6
+
+
+async def test_poll_falls_back_to_ls_when_inspect_fails(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    monkeypatch.setenv("FAKE_PASEO_INSPECT_FAIL", "1")
+    rings = []
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    monkeypatch.setattr(app, "bell", lambda: rings.append(1))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        monkeypatch.setenv("FAKE_PASEO_STATUS", "idle")
+        await settle(pilot, app, "alert: agent idle")  # still noticed, through the old ls path
+    rec = recorded(calls)
+    assert sum(c[:2] == ["ls", "-g"] for c in rec) >= 2 and rings

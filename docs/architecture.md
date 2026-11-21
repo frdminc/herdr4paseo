@@ -7,10 +7,11 @@ herdr4paseo owns nothing. The agent, its history and its permissions live in the
 | Purpose | Command | When |
 | --- | --- | --- |
 | Stop the agent (Ctrl+X, after confirmation) | `paseo stop <id>` | On request |
-| List agents, for the picker and the status line | `paseo ls -g -a --json` | On start, on Ctrl+L, every 3 s |
+| List agents, for the picker | `paseo ls -g -a --json` | On start, on Ctrl+L; also the status poll's fallback when `inspect` fails |
+| Status and pending-request check | `paseo agent inspect <id> --json` | Every 5 s while running, 15 to 60 s while idle (README, Polling) |
 | Stream the log | `paseo logs <id> --no-color --tail N -f` (plus `--filter tools` in tools-only view) | On attach; restarted by Ctrl+O |
 | Send a prompt | `paseo send <id> --no-wait --behavior steer\|interrupt "<text>"` | On Enter |
-| Find pending permission requests | `paseo permit ls --json` | Every 3 s; filtered to the shown agent |
+| Find pending permission requests | `paseo permit ls --json` | On attach, before answering, and when `inspect` reports a pending request; filtered to the shown agent |
 | Answer one request | `paseo permit allow\|deny <agent> <request-id>` | After you confirm; one call per listed request |
 
 It never runs `paseo permit allow <agent>` without a request id, because that form approves everything pending, including requests that arrived after you looked.
@@ -50,6 +51,7 @@ All colour decisions are in `core.py`.
 | File | Role |
 | --- | --- |
 | `src/herdr4paseo/core.py` | Pure helpers: argv builders, parsing of agent, permission and command listings, command matching, the style token table (`THEME`) and `LogStyler`. No I/O. |
+| `src/herdr4paseo/poll.py` | Pure: the poll schedule (`PollConfig`, `PollSchedule`, fake-clock tested) and the `paseo agent inspect` argv and parser. |
 | `src/herdr4paseo/daemon.py` | The WebSocket client for `list_commands_request`. |
 | `src/herdr4paseo/app.py` | The Textual UI: log, prompt, picker, permission banner and confirmation, slash panel, key bindings, `main()`. |
 | `tests/fake_paseo.py` | A fake `paseo` executable that records its argv, selected with `PASEO_BIN`. |
