@@ -8,7 +8,7 @@ herdr4paseo owns nothing. The agent, its history and its permissions live in the
 | --- | --- | --- |
 | Stop the agent (Ctrl+X, after confirmation) | `paseo stop <id>` | On request |
 | List agents, for the picker | `paseo ls -g -a --json` | On start, on Ctrl+L; also the status poll's fallback when `inspect` fails |
-| Status and pending-request check | `paseo agent inspect <id> --json` | Every 5 s while running, 15 to 30 s while idle (README, Polling) |
+| Status and pending-request check | `fetch_agent_request` over one persistent daemon WebSocket (`daemon.DaemonSession`); fallback `paseo agent inspect <id> --json` | Every 5 s while running, 15 to 30 s while idle (README, Polling); the CLI only while the daemon is unreachable or answers oddly |
 | Read the follow file (`--follow-file`) | no `paseo` call: a non-blocking read of a regular file, rejected over 4 KiB; an id that changed is looked up with `paseo ls` and matched by full id only | Every second |
 | Archived check (`--follow-file` only) | `paseo ls -g --json` (no `-a`); an agent `ls -a` lists but this does not is archived, since Paseo has no archived status | On attach, with every status poll, and before each prompt |
 | Stream the log | `paseo logs <id> --no-color --tail N -f` (plus `--filter tools` in tools-only view) | On attach; restarted by Ctrl+O |
@@ -53,10 +53,11 @@ All colour decisions are in `core.py`.
 | File | Role |
 | --- | --- |
 | `src/herdr4paseo/core.py` | Pure helpers: argv builders, parsing of agent, permission and command listings, command matching, the style token table (`THEME`) and `LogStyler`. No I/O. |
+| `src/herdr4paseo/daemon.py` | WebSocket client: `fetch_commands` (one-shot slash-command list) and `DaemonSession` (one persistent connection answering `fetch_agent_request`, bounded reconnect back-off, never blocks the UI: it is awaited on the app's loop). |
 | `src/herdr4paseo/poll.py` | Pure: the poll schedule (`PollConfig`, `PollSchedule`, fake-clock tested) and the `paseo agent inspect` argv and parser. |
-| `src/herdr4paseo/daemon.py` | The WebSocket client for `list_commands_request`. |
 | `src/herdr4paseo/app.py` | The Textual UI: log, prompt, picker, permission banner and confirmation, slash panel, key bindings, `main()`. |
 | `tests/fake_paseo.py` | A fake `paseo` executable that records its argv, selected with `PASEO_BIN`. |
+| `tests/fake_ws.py` | An in-process fake WebSocket connection (no socket, no port) that plays the daemon for `DaemonSession`: status, pending requests, and injected faults. |
 | `tests/fake_daemon.py` | An in-process WebSocket server that answers `hello` and `list_commands_request`. |
 
 Textual details worth knowing: `push_screen_wait` only works inside a worker, so the agent picker and permission confirmation run as `@work` workers in separate groups so they do not cancel each other or the log stream. Ctrl+A and Ctrl+D are priority bindings gated by `check_action`, so they only take over from the prompt's own keys while a request is pending. The command palette is disabled because Ctrl+P is prompt history.

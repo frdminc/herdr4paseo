@@ -291,6 +291,7 @@ async def test_deny_is_instant_inside_the_allow_delay(pending, calls):
 
 @pytest.fixture
 async def daemon(calls, monkeypatch):
+    monkeypatch.setenv("HERDR4PASEO_DAEMON_STATUS", "0")  # this fake answers no fetch_agent_request: keep polls on the CLI
     async with serve() as fake:
         monkeypatch.setenv("PASEO_HOST", f"127.0.0.1:{fake.port}")
         yield fake
@@ -1564,3 +1565,222 @@ async def test_a_slow_logs_start_does_not_turn_its_replay_into_a_wake_up(calls, 
     rec = recorded(calls)
     assert sum(c[0] == "logs" for c in rec) >= 3
     assert sum(c[:2] == ["agent", "inspect"] for c in rec) <= 2
+
+
+# -- status over the daemon's WebSocket (daemon.DaemonSession), CLI as the fallback ----------------
+
+import herdr4paseo.daemon as daemon_module  # noqa: E402
+from fake_ws import FakeLink  # noqa: E402
+from herdr4paseo.daemon import DaemonSession  # noqa: E402
+
+AGENT_B = "bbbbbbb2-0000-0000-0000-000000000002"
+
+
+def cli_probes(calls) -> int:
+    return sum(c[:2] == ["agent", "inspect"] for c in recorded(calls))
+
+
+def with_daemon(app: Herdr4PaseoApp, link: FakeLink) -> DaemonSession:
+    app._daemon = DaemonSession(connect=link.connect, timeout=2.0)
+    return app._daemon
+
+
+async def test_status_comes_over_the_daemon_session_without_starting_paseo(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    link, rings = FakeLink(), []
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    with_daemon(app, link)
+    monkeypatch.setattr(app, "bell", lambda: rings.append(1))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if len(link.requests) >= 3:
+                break
+        assert len(link.requests) >= 3 and len(link.connections) == 1  # one connection, many polls
+        link.status = "idle"
+        await settle(pilot, app, "alert: agent idle")  # noticed through the daemon, not the CLI
+        assert "idle" in app.sub_title and rings
+    assert cli_probes(calls) == 0
+    assert sum(c[:2] == ["ls", "-g"] for c in recorded(calls)) == 1  # only the attach listing
+    assert link.last.closed  # unmounting closes the session
+
+
+async def test_a_pending_request_seen_over_the_daemon_loads_its_label_from_permit_ls(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    link = FakeLink()
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    with_daemon(app, link)
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        permits = [{"id": "p1", "agentId": AGENT_A, "agentShortId": "aaaaaaa", "name": "Bash", "description": "ls"}]
+        monkeypatch.setenv("FAKE_PASEO_PERMITS", json.dumps(permits))
+        link.pending = [{"id": "p1"}]
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if [p.id for p in app.permits] == ["p1"]:
+                break
+        assert [p.id for p in app.permits] == ["p1"]
+        monkeypatch.setenv("FAKE_PASEO_PERMITS", "[]")
+        link.pending = []  # answered in the Paseo app
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if not app.permits:
+                break
+        assert app.permits == [] and app.query_one("#permits").has_class("hidden")
+    assert cli_probes(calls) == 0
+
+
+async def test_daemon_down_at_start_falls_back_to_the_cli_and_does_not_hammer_it(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    monkeypatch.setattr(daemon_module, "BACKOFF_FIRST", 60.0)
+    link = FakeLink()
+    link.down = True
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    session = with_daemon(app, link)
+    async with app.run_test() as pilot:
+        await wait_for_calls(pilot, calls, lambda c: sum(x[:2] == ["agent", "inspect"] for x in c) >= 3)
+    assert session.connects == 1  # one dial, then the back-off keeps it quiet while the CLI polls
+
+
+async def test_daemon_dropping_mid_session_falls_back_then_reconnects(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    monkeypatch.setattr(daemon_module, "BACKOFF_FIRST", 1.0)
+    link = FakeLink()
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    session = with_daemon(app, link)
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if link.requests:
+                break
+        assert cli_probes(calls) == 0
+        link.last.drop()
+        await wait_for_calls(pilot, calls, lambda c: sum(x[:2] == ["agent", "inspect"] for x in c) >= 1)  # CLI carries the gap
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if len(link.connections) == 2:
+                break
+        assert len(link.connections) == 2 and session.connects == 2  # reconnected after the back-off
+        seen = len(link.requests)
+        settled = cli_probes(calls)
+        await pilot.pause(1.5)
+        assert len(link.requests) > seen  # the daemon answers polls again
+        assert cli_probes(calls) <= settled + 1  # at most one in-flight CLI probe finished
+
+
+async def test_a_daemon_error_for_the_agent_falls_back_to_the_cli_for_that_poll(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    link = FakeLink()
+    link.null_agent = True  # an unknown agent: the daemon says null, the CLI gets to explain
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    with_daemon(app, link)
+    async with app.run_test() as pilot:
+        await wait_for_calls(pilot, calls, lambda c: any(x[:2] == ["agent", "inspect"] for x in c))
+
+
+async def test_a_daemon_reply_for_the_old_agent_never_touches_the_new_agents_banner(calls, monkeypatch):
+    fast_polls(monkeypatch, ACTIVE="30", IDLE="30", IDLE_MAX="30", FAST="0.5", BURST="0.5")
+    permits = [{"id": "pb", "agentId": AGENT_B, "agentShortId": "bbbbbbb", "name": "Bash", "description": "ls"}]
+    monkeypatch.setenv("FAKE_PASEO_PERMITS", json.dumps(permits))
+    link = FakeLink()
+    link.delays[AGENT_A] = 1.5  # alpha's answer comes late and says "nothing pending"
+    link.pendings[AGENT_B] = [{"id": "pb"}]
+    shown = []
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    with_daemon(app, link)
+    original = app._show_permits
+    monkeypatch.setattr(app, "_show_permits", lambda p: (shown.append([x.id for x in p]), original(p))[1])
+    async with app.run_test() as pilot:
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if any(r["agentId"] == AGENT_A for r in link.requests):
+                break
+        assert any(r["agentId"] == AGENT_A for r in link.requests)  # alpha's slow request is in flight
+        app._choose_agent("bbbbbbb")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if [p.id for p in app.permits] == ["pb"]:
+                break
+        assert [p.id for p in app.permits] == ["pb"]
+        shown.clear()
+        await pilot.pause(2.0)  # alpha's stale reply arrives in here
+        assert [] not in shown
+        assert [p.id for p in app.permits] == ["pb"]
+
+
+async def test_malformed_daemon_frames_do_not_disturb_polling(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    link = FakeLink()
+    link.junk = ["not json", "[]", json.dumps({"type": "session", "message": {"type": "fetch_agent_response", "payload": 3}})]
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    with_daemon(app, link)
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if len(link.requests) >= 3:
+                break
+        assert len(link.requests) >= 3 and "running" in app.sub_title
+    assert cli_probes(calls) == 0
+
+
+async def test_the_daemon_session_can_be_switched_off(calls, monkeypatch):
+    monkeypatch.setenv("HERDR4PASEO_DAEMON_STATUS", "0")
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    assert app._daemon is None
+
+
+async def test_an_unexpected_error_from_the_session_still_falls_back_to_the_cli(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+
+    class Broken:
+        async def fetch_agent(self, agent_id):
+            raise TypeError("odd")
+
+        async def close(self):
+            pass
+
+    app._daemon = Broken()
+    async with app.run_test() as pilot:
+        await wait_for_calls(pilot, calls, lambda c: any(x[:2] == ["agent", "inspect"] for x in c))
+
+
+async def test_a_permit_refresh_finishing_while_the_app_shuts_down_is_harmless(calls, monkeypatch):
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        monkeypatch.setattr(app, "query_one", lambda *a, **k: (_ for _ in ()).throw(app_module.NoMatches("gone")))
+        app._show_permits([])  # the banner widget is not there: no crash, the state is still recorded
+        assert app.permits == []
+
+
+async def test_follow_id_change_reaches_the_daemon_session_lookup(follow, calls, monkeypatch):
+    fast_polls(monkeypatch)
+    follow.write_text(AGENT_A)
+    link = FakeLink()
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    with_daemon(app, link)
+    async with app.run_test() as pilot:
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if any(r["agentId"] == AGENT_A for r in link.requests):
+                break
+        assert any(r["agentId"] == AGENT_A for r in link.requests)
+        link.statuses[AGENT_B] = "idle"
+        write_atomically(follow, AGENT_B + "\n")  # the new lead
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if any(r["agentId"] == AGENT_B for r in link.requests):
+                break
+        assert any(r["agentId"] == AGENT_B for r in link.requests)  # the poll followed the id change
+        assert len(link.connections) == 1  # same connection, new agent
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if "idle" in app.sub_title:
+                break
+        assert "idle" in app.sub_title
