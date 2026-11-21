@@ -93,6 +93,9 @@ elif cmd == "logs":
     if not tools_only:
         print("plain assistant line")
     sys.stdout.flush()
+    if os.environ.get("FAKE_PASEO_LOG_LATE"):  # new output a moment after the replayed tail
+        time.sleep(float(os.environ["FAKE_PASEO_LOG_LATE"]))
+        print("late line", flush=True)
     if os.environ.get("FAKE_PASEO_LOGS_EXIT"):
         sys.exit(0)
     time.sleep(30)  # `-f` follows until killed

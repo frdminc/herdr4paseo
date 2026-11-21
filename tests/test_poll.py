@@ -167,3 +167,10 @@ def test_parse_inspect_reads_status_and_pending():
 def test_parse_inspect_rejects_anything_else_so_the_caller_falls_back(raw):
     with pytest.raises(ValueError):
         parse_inspect(raw, AGENT)
+
+
+def test_a_burst_never_slows_the_running_rate_even_with_a_big_fast_setting():
+    clock = Clock()
+    poll = schedule(clock, fast=60.0)
+    poll.observe("running", 0)
+    assert poll.delay() == 5.0

@@ -107,7 +107,7 @@ class PollSchedule:
         """The log stream produced output. True asks the app to poll now rather than wait.
 
         Only a settled agent can wake up unseen (it is the long wait), so only then, and at most
-        once per `min(idle, burst)` seconds: output while running or replayed on reattach costs nothing.
+        once per `min(idle, burst)` seconds: output while running costs nothing, and the app ignores a stream's replayed tail.
         """
         now = self._clock()
         if self.status == "running" or (self._seen and self._seen[1]) or now < self._boost_until:
@@ -124,7 +124,7 @@ class PollSchedule:
         """Seconds until the next poll."""
         cfg = self.config
         if self._clock() < self._boost_until:
-            return cfg.fast
+            return min(cfg.fast, cfg.active)  # a burst never slows the running rate
         if self._seen and (self._seen[0] == "running" or self._seen[1]):
             return cfg.active
         return min(cfg.idle_max, cfg.idle * 2 ** min(self._unchanged, 16))

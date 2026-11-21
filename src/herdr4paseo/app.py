@@ -76,6 +76,7 @@ MAX_LOG_LINES = 20_000  # per RichLog: older lines scroll off instead of growing
 RENDER_BUDGET_CHARS = 512_000  # newest items rendered per chat redraw; older ones show as a count
 RENDER_SECONDS = 0.1  # at most ~10 chat re-renders a second however fast records arrive
 RECONNECT_SECONDS = 3.0
+STREAM_SETTLE_SECONDS = 1.0  # log output this soon after (re)attaching is replay or an error, not a wake-up
 # `y` in an ALLOW dialog is ignored (bell) for this long after the dialog mounts, so a fast
 # repeated Ctrl+A, y cannot approve a request that was on screen for only a split second.
 ALLOW_DELAY_SECONDS = 0.5
@@ -347,6 +348,7 @@ class Herdr4PaseoApp(App[None]):
         self._poll = PollSchedule(PollConfig.from_env())  # status polling cadence (poll.py)
         self._poll_timer = None
         self._poll_due = 0.0
+        self._stream_up_at = 0.0  # when the log stream last (re)attached
         self._polling = False
 
     def compose(self) -> ComposeResult:
@@ -549,6 +551,7 @@ class Herdr4PaseoApp(App[None]):
                 self._note(f"cannot run paseo: {exc.strerror or exc}; retrying in {RECONNECT_SECONDS:g}s", "error.text")
                 await asyncio.sleep(RECONNECT_SECONDS)
                 continue
+            self._stream_up_at = time.monotonic()
             try:
                 assert proc.stdout is not None
                 async for line in iter_record_lines(proc.stdout, MAX_LOG_LINE_BYTES):
@@ -649,6 +652,7 @@ class Herdr4PaseoApp(App[None]):
                     self._note("skipped a stderr line over %d KiB" % (MAX_LOG_LINE_BYTES >> 10) if line is None
                                else line.decode(errors="replace").rstrip(), "meta")
             reader = asyncio.create_task(notices())
+            self._stream_up_at = time.monotonic()
             try:
                 assert proc.stdout is not None
                 async for line in iter_record_lines(proc.stdout, MAX_RECORD_BYTES):
@@ -670,6 +674,9 @@ class Herdr4PaseoApp(App[None]):
             await asyncio.sleep(RECONNECT_SECONDS)
 
     def _log_activity(self) -> None:
+        # the first second of a stream is its replayed tail or a failure notice, not new output
+        if time.monotonic() - self._stream_up_at < STREAM_SETTLE_SECONDS:
+            return
         if self._poll.log_activity():  # a settled agent is producing output: look now, not in a minute
             self._wake_poll()
 
