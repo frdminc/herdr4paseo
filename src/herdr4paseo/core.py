@@ -176,9 +176,10 @@ FOLLOW_FILE_MAX_BYTES = 4096
 def read_follow_id(path: str) -> tuple[str | None, str]:
     """Read the one full agent id (lower-cased) held in `path`: (id, "") or (None, why it cannot be used yet).
 
-    Never raises or blocks: a missing, unreadable, special (FIFO, directory, device), empty or garbled
-    file is a state to wait out, not a reason to close the tab. Surrounding whitespace and blank lines
-    are ignored.
+    Never raises, and never waits for a FIFO's writer (it opens non-blocking and refuses anything but a
+    regular file; a hung network mount can still stall the read). A missing, unreadable, special, empty
+    or garbled file is a state to wait out, not a reason to close the tab. Surrounding whitespace and
+    blank lines are ignored.
     """
     try:
         # O_NONBLOCK: opening a FIFO must not wait for a writer (it would freeze the event loop)
@@ -383,6 +384,11 @@ def stop_argv(agent_id: str) -> list[str]:
 def ls_argv() -> list[str]:
     # -g: all workspaces; -a: archived too, so an agent you attached to stays findable.
     return [paseo_bin(), "ls", "-g", "-a", "--json"]
+
+
+def ls_active_argv() -> list[str]:
+    # Without -a, archived agents are left out: an id in `ls_argv` output but not here is archived.
+    return [paseo_bin(), "ls", "-g", "--json"]
 
 
 def logs_argv(agent: str, *, tail: int, tools_only: bool) -> list[str]:

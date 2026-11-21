@@ -21,7 +21,12 @@ if cmd == "logs" and os.environ.get("FAKE_PASEO_PIDS"):  # lets a test prove a r
     with open(os.environ["FAKE_PASEO_PIDS"], "a") as pids:
         pids.write(f"{sys.argv[2]} {os.getpid()}\n")
 if cmd == "ls":
-    print(json.dumps(AGENTS))
+    # Real paseo: archived agents appear only with -a, and their status is idle/closed, never "archived".
+    archived = os.environ.get("FAKE_PASEO_ARCHIVED", "")
+    if "-a" not in sys.argv and os.environ.get("FAKE_PASEO_LS_PLAIN_FAIL"):
+        print("ls failed", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps([a for a in AGENTS if "-a" in sys.argv or a["name"] != archived]))
 elif cmd == "logs":
     if "--json" in sys.argv:
         # Follow-mode records are deltas: three fragments with one messageId concatenate.
@@ -90,6 +95,10 @@ elif cmd == "logs":
         sys.exit(0)
     time.sleep(30)  # `-f` follows until killed
 elif cmd == "permit" and sys.argv[2] == "ls":
+    fail_flag = os.environ.get("FAKE_PASEO_PERMITS_FAIL_FILE")
+    if fail_flag and os.path.exists(fail_flag):  # a test creates the file to make `permit ls` fail from then on
+        print("daemon busy", file=sys.stderr)
+        sys.exit(1)
     out = os.environ.get("FAKE_PASEO_PERMITS", "[]")
     if os.environ.get("FAKE_PASEO_PERMITS_STATEFUL"):  # an answered request leaves the list, as in the real daemon
         with open(os.environ["FAKE_PASEO_CALLS"]) as seen:

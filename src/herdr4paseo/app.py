@@ -56,6 +56,7 @@ from .core import (
     timeline_argv,
     parse_timeline,
     render_timeline_item,
+    ls_active_argv,
     ls_argv,
     match_commands,
     parse_agents,
@@ -414,27 +415,46 @@ class Herdr4PaseoApp(App[None]):
 
     async def _attach(self, picked: Agent) -> None:
         """Show `picked`. The log, chat and command workers are exclusive, so the old agent's `paseo logs` child is ended."""
+        archived = await self._followed_archived(picked) if self._follow_file else False
         previous, self.agent = self.agent, picked
+        self.permits = []  # never keep the previous agent's requests under the new title
+        self.refresh_bindings()
+        with contextlib.suppress(NoMatches):
+            self.query_one("#permits", Static).add_class("hidden")
         self._last_status = picked.status
         self.title = sanitize_line(f"{picked.name} ({picked.short_id})")
         self._update_subtitle(picked.status)
-        self._stream_banner = self._attach_banner(previous, picked)
+        self._stream_banner = self._attach_banner(previous, picked, archived)
         self._start_stream()
         self._load_commands(picked.id)
         await self._refresh_permits()
 
     # -- following an id file -------------------------------------------------------
 
-    def _attach_banner(self, previous: Agent | None, picked: Agent) -> str:
+    async def _followed_archived(self, agent: Agent) -> bool | None:
+        """Is `agent` archived? Real `paseo ls` never reports an "archived" status: an archived agent is
+        listed by `ls -a` (which found it) but not by plain `ls`. None when that cannot be told."""
+        code, out, _err = await run_paseo(ls_active_argv())
+        if code != 0:
+            return None
+        try:
+            active = parse_agents(out)
+        except (ValueError, TypeError, AttributeError):
+            return None
+        return all(a.id != agent.id for a in active)
+
+    def _attach_banner(self, previous: Agent | None, picked: Agent, archived: bool | None) -> str:
         """Follow mode only: say why the log changed, and flag an archived agent plainly."""
         if not self._follow_file:
             return ""
         lines = []
         if previous is not None and previous.id != picked.id:
             lines.append(f"follow: switched from {previous.name} ({previous.short_id}) to {picked.name} ({picked.short_id})")
-        if picked.status == "archived":
+        if archived:
             lines.append(self._archived_text(picked))
             self._archived_noted = picked.id
+        elif archived is None:
+            lines.append(f"could not tell whether {picked.name} ({picked.short_id}) is archived; prompts are not sent until it can")
         return "\n".join(lines)
 
     def _archived_text(self, agent: Agent) -> str:
@@ -481,7 +501,10 @@ class Herdr4PaseoApp(App[None]):
         if current is not None:
             self._update_subtitle(current.status)
             if self._follow_file:
-                if current.status != "archived":
+                archived = await self._followed_archived(current)
+                if self.agent is not agent:
+                    return
+                if not archived:
                     self._archived_noted = None
                 elif self._archived_noted != current.id:
                     self._archived_noted = current.id
@@ -545,7 +568,8 @@ class Herdr4PaseoApp(App[None]):
 
     def _note(self, message: str, token: str) -> None:
         """Write one of herdr4paseo's own lines to the log, styled by a core.THEME token."""
-        self.query_one("#log", RichLog).write(Text(sanitize_text(message), style=style_for(token)))
+        with contextlib.suppress(NoMatches):  # a poll that lands during shutdown
+            self.query_one("#log", RichLog).write(Text(sanitize_text(message), style=style_for(token)))
 
     @work(exclusive=True, group="stream")
     async def _start_stream(self) -> None:
@@ -753,9 +777,15 @@ class Herdr4PaseoApp(App[None]):
         if text.lower() in QUIT_COMMANDS:  # handled here, never sent to the agent
             self.exit()
             return
-        if self._follow_file and self._last_status == "archived":  # a message would un-archive it
-            self._note(f"not sent: {sanitize_line(self.agent.name)} is archived and the follow file names no other agent", "error.text")
-            return
+        if self._follow_file:  # a message would un-archive an archived agent: ask now, and fail closed
+            target = self.agent
+            archived = await self._followed_archived(target)
+            if archived or archived is None or self.agent is not target:
+                why = "is archived and the follow file names no other agent" if archived else "could not be checked for archival" if archived is None else "was switched while you typed; press Enter again"
+                notice = f"not sent: {sanitize_line(target.name)} {why}"
+                self._note(notice, "error.text")
+                self.notify(notice, severity="warning")  # the log is hidden in chat view
+                return
         code, _out, err = await run_paseo(send_argv(self.agent.id, text, self.behavior))
         if code != 0:
             self._note(f"send failed (rc={code}): {err.strip()}", "error.text")
@@ -794,7 +824,7 @@ class Herdr4PaseoApp(App[None]):
         await self._refresh_permits()
         if self.agent is not agent:
             return
-        pending = list(self.permits)
+        pending = [p for p in self.permits if p.agent_id == agent.id]
         shown = permit_batch(pending, decision)  # answer exactly what the confirmation lists in full
         if not pending:
             self._note("no pending permission requests", "meta")

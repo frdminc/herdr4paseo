@@ -1308,8 +1308,14 @@ async def test_status_poll_that_spans_a_switch_is_dropped(follow, calls, monkeyp
         assert app.sub_title.startswith("idle")
 
 
-async def test_follow_archived_agent_is_flagged_and_refuses_prompts(follow, calls, monkeypatch):
-    monkeypatch.setenv("FAKE_PASEO_STATUS", "archived")
+@pytest.fixture
+def archived(monkeypatch):
+    """alpha is archived the way real paseo shows it: only `ls -a` lists it, and its status is `closed`."""
+    monkeypatch.setenv("FAKE_PASEO_ARCHIVED", "alpha")
+    monkeypatch.setenv("FAKE_PASEO_STATUS", "closed")
+
+
+async def test_follow_archived_agent_is_flagged_and_refuses_prompts(follow, calls, archived):
     follow.write_text(AGENT_A)
     app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
     async with app.run_test() as pilot:
@@ -1321,14 +1327,67 @@ async def test_follow_archived_agent_is_flagged_and_refuses_prompts(follow, call
     assert not any(c[0] == "send" for c in recorded(calls))
 
 
-async def test_archived_agent_still_accepts_prompts_without_follow_file(calls, monkeypatch):
-    monkeypatch.setenv("FAKE_PASEO_STATUS", "archived")
+async def test_follow_archived_check_happens_at_send_time(follow, calls, monkeypatch):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        monkeypatch.setenv("FAKE_PASEO_ARCHIVED", "alpha")  # archived after the tab attached, before the next poll
+        await pilot.press(*"late", "enter")
+        await settle(pilot, app, "not sent")
+    assert not any(c[0] == "send" for c in recorded(calls))
+
+
+async def test_follow_live_agent_still_gets_prompts(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        assert "archived" not in log_text(app)
+        await pilot.press(*"hello", "enter")
+        await pilot.pause(0.5)
+    assert any(c[0] == "send" and c[-1] == "hello" for c in recorded(calls))
+
+
+async def test_follow_prompts_fail_closed_when_archival_cannot_be_checked(follow, calls, monkeypatch):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        monkeypatch.setenv("FAKE_PASEO_LS_PLAIN_FAIL", "1")
+        await pilot.press(*"hello", "enter")
+        await settle(pilot, app, "could not be checked for archival")
+    assert not any(c[0] == "send" for c in recorded(calls))
+
+
+async def test_archived_agent_still_accepts_prompts_without_follow_file(calls, archived):
     app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
     async with app.run_test() as pilot:
         await pilot.pause(0.5)
         await pilot.press(*"hello", "enter")
         await pilot.pause(0.5)
     assert any(c[0] == "send" for c in recorded(calls))  # existing behaviour is unchanged
+
+
+async def test_follow_switch_clears_the_old_agents_permits_when_permit_ls_fails(follow, calls, monkeypatch, tmp_path):
+    flag = tmp_path / "permits-fail"
+    monkeypatch.setenv("FAKE_PASEO_PERMITS", PERMITS)
+    monkeypatch.setenv("FAKE_PASEO_PERMITS_FAIL_FILE", str(flag))
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await banner_visible(pilot, app)
+        assert app.permits
+        flag.touch()  # the daemon is busy from now on
+        write_atomically(follow, AGENT_B)
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        await pilot.pause(0.3)
+        assert app.permits == []  # A's requests are not kept under B's title
+        assert app.query_one("#permits").has_class("hidden")
+        await pilot.press("ctrl+a")  # no pending requests: this is the prompt's own line-start key
+        await pilot.pause(0.3)
+        assert type(app.screen).__name__ != "ConfirmPermits"
+    assert permit_calls(calls) == []
 
 
 async def test_follow_fifo_does_not_block_the_loop(follow, calls):
