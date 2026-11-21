@@ -1,6 +1,7 @@
 import ast
 import json
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -38,7 +39,9 @@ def recorded(path: Path) -> list[list[str]]:
 
 
 def log_text(app: Herdr4PaseoApp) -> str:
-    return "\n".join(line.text for line in app.query_one("#log", RichLog).lines)
+    """The log with whitespace collapsed: the 80-column view wraps a phrase onto two lines, depending on
+    the length of the temp path a notice carries, so a needle must not depend on where it wraps."""
+    return re.sub(r"\s+", " ", "\n".join(line.text for line in app.query_one("#log", RichLog).lines))
 
 
 async def settle(pilot, app, needle: str) -> None:
@@ -506,7 +509,10 @@ async def test_ctrl_l_opens_the_agent_picker_and_ctrl_g_does_not(calls):
         await pilot.pause(0.2)
         assert type(app.screen).__name__ not in ("PickAgent",)
         await pilot.press("ctrl+l")
-        await pilot.pause(0.2)
+        for _ in range(100):  # a loaded machine can take longer than a fixed pause
+            await pilot.pause(0.05)
+            if type(app.screen).__name__ == "PickAgent":
+                break
         assert type(app.screen).__name__ == "PickAgent"
 
 

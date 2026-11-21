@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 
 from textual import events, work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.css.query import NoMatches
@@ -418,8 +418,8 @@ class Herdr4PaseoApp(App[None]):
         archived = await self._followed_archived(picked) if self._follow_file else False
         previous, self.agent = self.agent, picked
         self.permits = []  # never keep the previous agent's requests under the new title
-        self.refresh_bindings()
-        with contextlib.suppress(NoMatches):
+        with contextlib.suppress(NoMatches, ScreenStackError):  # both mean the app is shutting down
+            self.refresh_bindings()
             self.query_one("#permits", Static).add_class("hidden")
         self._last_status = picked.status
         self.title = sanitize_line(f"{picked.name} ({picked.short_id})")
@@ -531,10 +531,10 @@ class Herdr4PaseoApp(App[None]):
             self.permits = parse_permissions(out, agent.id)
         except (ValueError, TypeError, AttributeError):
             return
-        self.refresh_bindings()
         try:
+            self.refresh_bindings()
             banner = self.query_one("#permits", Static)
-        except NoMatches:  # the app is shutting down (a quit while an attach was polling)
+        except (NoMatches, ScreenStackError):  # the app is shutting down (a quit while an attach was polling)
             return
         if self.permits:
             names = "; ".join(clip_label(p.label, 80) for p in self.permits[:3])
