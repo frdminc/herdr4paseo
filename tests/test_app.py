@@ -1746,3 +1746,12 @@ async def test_an_unexpected_error_from_the_session_still_falls_back_to_the_cli(
     app._daemon = Broken()
     async with app.run_test() as pilot:
         await wait_for_calls(pilot, calls, lambda c: any(x[:2] == ["agent", "inspect"] for x in c))
+
+
+async def test_a_permit_refresh_finishing_while_the_app_shuts_down_is_harmless(calls, monkeypatch):
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        monkeypatch.setattr(app, "query_one", lambda *a, **k: (_ for _ in ()).throw(app_module.NoMatches("gone")))
+        app._show_permits([])  # the banner widget is not there: no crash, the state is still recorded
+        assert app.permits == []
