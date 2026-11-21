@@ -203,10 +203,11 @@ async def test_a_flood_of_unreadable_frames_drops_the_connection(link):
     (lambda l: setattr(l, "response_error", "ambiguous agent"), "ambiguous agent"),
     (lambda l: setattr(l, "rpc_error", "boom " * 200), "boom"),
     (lambda l: setattr(l, "reject", "bad credential"), "bad credential"),
+    (lambda l: setattr(l, "silent_hello", True), "admit"),
 ])
 async def test_errors_and_odd_answers_raise_daemon_error(link, tweak, match):
     tweak(link)
-    session = session_for(link)
+    session = session_for(link, timeout=0.3)
     with pytest.raises(DaemonError, match=match) as err:
         await session.fetch_agent("agent-1")
     assert len(str(err.value)) < 400  # a daemon-supplied reason is clipped
@@ -236,14 +237,74 @@ async def test_a_late_answer_to_an_abandoned_request_is_ignored(link):
     await session.close()
 
 
-async def test_close_stops_the_reader_and_is_idempotent(link):
+async def test_close_stops_the_reader_is_idempotent_and_final(link):
     session = session_for(link)
     await session.fetch_agent("agent-1")
     reader = session._reader
     await session.close()
     await session.close()
-    assert reader.done() and not session.connected
+    assert reader.done() and not session.connected and not session._closers
     assert link.last.closed
+    with pytest.raises(DaemonError, match="closed"):  # a poll after unmount must not open a new socket
+        await session.fetch_agent("agent-1")
+    assert len(link.connections) == 1
+
+
+async def test_hello_declares_a_modern_client_so_the_daemon_does_not_stream_other_agents(link):
+    session = session_for(link)
+    await session.fetch_agent("agent-1")
+    caps = link.hellos[0]["capabilities"]
+    assert caps["owned_subscriptions"] is True and caps["all_providers"] is True and caps["selective_agent_timeline"] is True
+    assert link.streamed == 0
+    await session.close()
+    # the guard against a regression: a hello without the capabilities is what makes the fake stream the fleet
+    link2 = FakeLink()
+    conn = await link2.connect("ws://x", 1)
+    await conn.send(json.dumps({"type": "hello", "clientId": "x", "clientType": "cli", "protocolVersion": 1}))
+    await asyncio.sleep(0.05)
+    assert link2.streamed == 50
+
+
+async def test_no_request_is_sent_before_the_daemon_admits_the_hello(link):
+    link.admit_delay = 0.2
+    session = session_for(link)
+    assert (await session.fetch_agent("agent-1")).status == "running"
+    assert link.premature == 0
+    await session.close()
+
+
+async def test_a_session_frame_before_admission_is_what_the_fake_daemon_punishes(link):
+    link.admit_delay = 0.2
+    conn = await link.connect("ws://x", 1)
+    await conn.send(json.dumps({"type": "hello", "clientId": "x", "clientType": "cli", "protocolVersion": 1}))
+    await conn.send(json.dumps({"type": "session", "message": {"type": "fetch_agent_request", "requestId": "r", "agentId": "a"}}))
+    assert link.premature == 1 and conn.closed
+
+
+async def test_websocket_is_opened_without_a_proxy(monkeypatch):
+    seen = {}
+
+    async def fake_connect(url, **kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(daemon_module.websockets, "connect", fake_connect)
+    await daemon_module._open("ws://127.0.0.1:6767/ws", 3.0)
+    assert seen["proxy"] is None and seen["max_size"] == daemon_module.MAX_FRAME_BYTES
+
+
+async def test_a_status_string_is_clipped(link):
+    link.status = "x" * 5000
+    session = session_for(link)
+    assert len((await session.fetch_agent("agent-1")).status) == daemon_module.MAX_STATUS_CHARS
+    await session.close()
+
+
+def test_daemon_url_survives_a_nonsense_config(home, monkeypatch):
+    (home / "config.json").write_text(json.dumps({"daemon": {"listen": None}}))
+    assert daemon_url() == "ws://127.0.0.1:6767/ws"
+    (home / "config.json").write_text(json.dumps({"daemon": {"listen": 7}}))
+    assert daemon_url() == "ws://127.0.0.1:6767/ws"
 
 
 async def test_too_many_requests_in_flight_are_refused(link):

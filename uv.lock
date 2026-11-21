@@ -29,7 +29,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "textual", specifier = ">=0.80" },
-    { name = "websockets", specifier = ">=13" },
+    { name = "websockets", specifier = ">=15" },
 ]
 
 [package.metadata.requires-dev]

@@ -3,7 +3,10 @@
 `FakeLink.connect` has the signature `DaemonSession(connect=...)` wants and returns a
 `FakeConnection` (send, close, async iteration). The link plays the daemon's side: it answers a
 `fetch_agent_request` with an agent snapshot built from `link.status` / `link.pending`, and the
-knobs below inject the faults the session must survive.
+knobs below inject the faults the session must survive. Like the real daemon it admits a hello
+asynchronously (`admit_delay`), closes a socket whose session frame arrives before that, answers a
+rejected hello with `hello.rejected` and a close, and streams unrelated `agent_stream` frames to a
+client that did not declare `owned_subscriptions` (what a legacy client gets).
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ class FakeConnection:
         self.sent: list[dict] = []
         self.inbox: asyncio.Queue = asyncio.Queue()
         self.closed = False
+        self.admitted = False
         self._tasks: set[asyncio.Task] = set()
 
     async def send(self, text: str) -> None:
@@ -27,15 +31,36 @@ class FakeConnection:
         self.sent.append(message)
         if message.get("type") == "hello":
             if self.link.reject:
-                self.push(json.dumps({"type": "hello_rejected", "reason": self.link.reject}))
+                self.push(json.dumps({"type": "hello.rejected", "reason": self.link.reject, "accepts": ["password"]}))
+                self.drop()
             else:
-                self.push(json.dumps({"type": "session", "message": {"type": "status", "payload": {"status": "server_info"}}}))
+                self._spawn(self._admit(message))
+            return
+        if not self.admitted:  # the real daemon: "Rejected pending message before hello"
+            self.link.premature += 1
+            self.drop()
             return
         inner = message.get("message") or {}
         if inner.get("type") == "fetch_agent_request":
-            task = asyncio.ensure_future(self._answer(inner))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._spawn(self._answer(inner))
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _admit(self, hello: dict) -> None:
+        if self.link.admit_delay:
+            await asyncio.sleep(self.link.admit_delay)
+        if self.closed:
+            return
+        self.admitted = True
+        if not self.link.silent_hello:
+            self.push(json.dumps({"type": "session", "message": {"type": "status", "payload": {"status": "server_info"}}}))
+        if not (hello.get("capabilities") or {}).get("owned_subscriptions"):
+            for n in range(self.link.legacy_frames):  # a legacy client is sent every agent's events
+                self.link.streamed += 1
+                self.push(json.dumps({"type": "session", "message": {"type": "agent_stream", "payload": {"agentId": f"other-{n}"}}}))
 
     async def _answer(self, request: dict) -> None:
         self.link.requests.append(request)
@@ -92,6 +117,11 @@ class FakeLink:
         self.response_error: str | None = None
         self.reply_id: str | None = None  # answer with another agent's id
         self.silent = False  # never answers
+        self.silent_hello = False  # never admits the hello
+        self.admit_delay = 0.0
+        self.legacy_frames = 50
+        self.streamed = 0  # unrelated frames pushed to a legacy client
+        self.premature = 0  # session frames that arrived before the hello was admitted
         self.down = False  # connect fails
         self.null_agent = False
         self.connections: list[FakeConnection] = []

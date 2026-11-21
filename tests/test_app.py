@@ -291,6 +291,7 @@ async def test_deny_is_instant_inside_the_allow_delay(pending, calls):
 
 @pytest.fixture
 async def daemon(calls, monkeypatch):
+    monkeypatch.setenv("HERDR4PASEO_DAEMON_STATUS", "0")  # this fake answers no fetch_agent_request: keep polls on the CLI
     async with serve() as fake:
         monkeypatch.setenv("PASEO_HOST", f"127.0.0.1:{fake.port}")
         yield fake
@@ -1729,3 +1730,19 @@ async def test_the_daemon_session_can_be_switched_off(calls, monkeypatch):
     monkeypatch.setenv("HERDR4PASEO_DAEMON_STATUS", "0")
     app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
     assert app._daemon is None
+
+
+async def test_an_unexpected_error_from_the_session_still_falls_back_to_the_cli(calls, monkeypatch):
+    fast_polls(monkeypatch)
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+
+    class Broken:
+        async def fetch_agent(self, agent_id):
+            raise TypeError("odd")
+
+        async def close(self):
+            pass
+
+    app._daemon = Broken()
+    async with app.run_test() as pilot:
+        await wait_for_calls(pilot, calls, lambda c: any(x[:2] == ["agent", "inspect"] for x in c))

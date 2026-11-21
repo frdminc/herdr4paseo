@@ -515,6 +515,8 @@ class Herdr4PaseoApp(App[None]):
         self._poll_timer, self._polling = None, True
         try:
             await self._refresh_status()
+        except ScreenStackError:  # the app is shutting down under a poll that was in flight
+            pass
         finally:
             self._polling = False
             self._arm_poll()
@@ -538,7 +540,7 @@ class Herdr4PaseoApp(App[None]):
             try:
                 state = await self._daemon.fetch_agent(agent_id)
                 return state.status, state.pending
-            except DaemonError:
+            except Exception:  # DaemonError, or anything odd: the CLI always has the next word
                 pass
         code, out, _err = await run_paseo(inspect_argv(agent_id))
         if code != 0:

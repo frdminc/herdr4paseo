@@ -9,7 +9,11 @@ does not start a Node `paseo` process. Everything else herdr4paseo does still go
 Wire format (getpaseo/paseo, packages/protocol/src/messages.ts): the client opens `/ws`, sends
 `{"type": "hello", ...}`, then `{"type": "session", "message": {...}}` frames. The daemon answers
 with `{"type": "session", "message": {"type": "fetch_agent_response", "payload": {"requestId",
-"agent", "error"}}}`, or an `rpc_error` carrying the same `requestId`, or `hello_rejected`.
+"agent", "error"}}}`, or an `rpc_error` carrying the same `requestId`; a refused hello is
+`hello.rejected` followed by a close. The daemon admits a hello asynchronously and answers it with a
+`status` frame (`server_info`); a session frame sent before that is rejected and the socket closed,
+so `DaemonSession` waits for it. A hello without `capabilities` makes the daemon treat the socket as
+a legacy client and stream it every agent's events, so the session says it is a modern one.
 """
 
 from __future__ import annotations
@@ -34,8 +38,19 @@ LOOPBACK = ("127.0.0.1", "localhost", "::1")
 MAX_FRAME_BYTES = 4 << 20  # an agent snapshot is a few KiB; refuse anything bigger than this on the wire
 MAX_BAD_FRAMES = 20  # unparseable or unrelated-looking frames tolerated per connection before dropping it
 MAX_IN_FLIGHT = 8
+MAX_STATUS_CHARS = 32  # the longest lifecycle status is "initializing"; a hostile peer cannot fill the header
+# packages/protocol/src/client-capabilities.ts. owned_subscriptions is the one that matters here: without it the
+# daemon streams every agent's timeline and events into this socket for as long as it stays open.
+CAPABILITIES = {
+    "hello_rejection": True,
+    "owned_subscriptions": True,
+    "explicit_event_subscriptions": True,
+    "selective_agent_timeline": True,
+    "all_providers": True,
+}
 BACKOFF_FIRST = 1.0  # seconds before the first reconnect attempt after a failure
 BACKOFF_MAX = 60.0
+HELLO_REJECTED = ("hello.rejected", "hello_rejected")  # the daemon sends the dotted form
 ENV_DAEMON_STATUS = "HERDR4PASEO_DAEMON_STATUS"  # "0" / "off" keeps every status poll on the CLI
 
 
@@ -55,6 +70,8 @@ def daemon_url() -> str:
             host = json.loads((paseo_home() / "config.json").read_text())["daemon"]["listen"]
         except (OSError, ValueError, KeyError, TypeError):
             host = DEFAULT_LISTEN
+        if not isinstance(host, str) or not host:  # a config the daemon itself would refuse
+            host = DEFAULT_LISTEN
     if "://" not in host:
         host = f"ws://{host}"
     parts = urlsplit(host)
@@ -72,13 +89,15 @@ def local_credential(url: str) -> str | None:
         return None
 
 
-def hello_message(url: str) -> dict[str, object]:
+def hello_message(url: str, *, modern: bool = False) -> dict[str, object]:
     hello: dict[str, object] = {
         "type": "hello",
         "clientId": "herdr4paseo",
         "clientType": "cli",
         "protocolVersion": 1,
     }
+    if modern:
+        hello["capabilities"] = dict(CAPABILITIES)
     token = local_credential(url)
     if token:
         hello["auth"] = {"kind": "localCredential", "token": token}
@@ -94,13 +113,13 @@ async def fetch_commands(agent_id: str, *, timeout: float = 30.0) -> list[Comman
         "message": {"type": "list_commands_request", "agentId": agent_id, "requestId": request_id},
     }
     try:
-        async with asyncio.timeout(timeout), websockets.connect(url, open_timeout=timeout) as ws:
+        async with asyncio.timeout(timeout), websockets.connect(url, open_timeout=timeout, proxy=None) as ws:
             await ws.send(json.dumps(hello))
             await ws.send(json.dumps(request))
             async for raw in ws:
                 message = json.loads(raw)
-                if message.get("type") == "hello_rejected":
-                    raise DaemonError(f"daemon rejected the connection: {message.get('reason', 'unknown')}")
+                if message.get("type") in HELLO_REJECTED:
+                    raise DaemonError(f"daemon rejected the connection: {clip_reason(message.get('reason', 'unknown'))}")
                 inner = message.get("message") if message.get("type") == "session" else None
                 if not isinstance(inner, dict) or inner.get("type") != "list_commands_response":
                     continue
@@ -144,7 +163,7 @@ def parse_agent_response(payload: object, agent_id: str) -> AgentState:
     status, pending = agent.get("status"), agent.get("pendingPermissions")
     if not isinstance(status, str) or not isinstance(pending, list):
         raise DaemonError("agent snapshot lacks status or pendingPermissions")
-    return AgentState(status, bool(pending))
+    return AgentState(status[:MAX_STATUS_CHARS], bool(pending))
 
 
 def clip_reason(value: object, limit: int = 200) -> str:
@@ -152,17 +171,20 @@ def clip_reason(value: object, limit: int = 200) -> str:
 
 
 async def _open(url: str, timeout: float) -> Any:
-    return await websockets.connect(url, open_timeout=timeout, max_size=MAX_FRAME_BYTES)
+    # proxy=None: websockets would otherwise tunnel a loopback daemon through HTTPS_PROXY/ALL_PROXY, token and all
+    return await websockets.connect(url, open_timeout=timeout, max_size=MAX_FRAME_BYTES, proxy=None)
 
 
 class DaemonSession:
     """One long-lived daemon connection that answers `fetch_agent_request`s.
 
-    Opened on the first request, never on the UI thread's behalf: every method is a coroutine the
-    app awaits, and the reader is a task on the same loop. A failure (refused, rejected hello, a
-    dropped or silent socket, an `rpc_error`) raises DaemonError and starts a back-off (1 s, doubling
-    to 60 s) during which `fetch_agent` raises at once, so the caller's CLI fallback does the work
-    and a down daemon is never hammered. A request that succeeds resets the back-off.
+    Opened on the first request: every method is a coroutine the app awaits and the reader is a task
+    on the same loop, so nothing here blocks the UI. The connection counts as open only once the
+    daemon has admitted the hello (its `status` frame); requests are never sent before that. A failure
+    (refused, rejected hello, a dropped or silent socket, an `rpc_error`) raises DaemonError and starts
+    a back-off (1 s, doubling to 60 s) during which `fetch_agent` raises at once, so the caller's CLI
+    fallback does the work and a down daemon is never hammered. Only a complete, valid answer resets
+    the back-off, so a daemon that accepts and then drops cannot cause a tight reconnect loop.
 
     `connect(url, timeout)` is injectable: tests pass an in-process fake connection with `send`,
     `close` and async iteration.
@@ -180,10 +202,13 @@ class DaemonSession:
         self._timeout = timeout
         self._ws: Any = None
         self._reader: asyncio.Task[None] | None = None
+        self._ready: asyncio.Future[None] | None = None  # resolved by the daemon's reply to the hello
+        self._closers: set[asyncio.Task[None]] = set()
         self._lock = asyncio.Lock()
         self._waiting: dict[str, asyncio.Future[object]] = {}
         self._delay = BACKOFF_FIRST
         self._retry_at = float("-inf")
+        self._closed = False
         self.connects = 0  # connection attempts so far (tests and diagnostics)
 
     @property
@@ -191,17 +216,18 @@ class DaemonSession:
         return self._ws is not None
 
     async def fetch_agent(self, agent_id: str) -> AgentState:
+        ws = await self._ensure()
         if len(self._waiting) >= MAX_IN_FLIGHT:
             raise DaemonError("too many daemon requests in flight")
-        ws = await self._ensure()
         request_id = str(uuid.uuid4())
         future: asyncio.Future[object] = asyncio.get_running_loop().create_future()
         self._waiting[request_id] = future
         try:
             frame = {"type": "session", "message": {"type": "fetch_agent_request", "requestId": request_id, "agentId": agent_id}}
             try:
-                await ws.send(json.dumps(frame))
-                payload = await asyncio.wait_for(future, self._timeout)
+                async with asyncio.timeout(self._timeout):  # the send and the wait share one bound
+                    await ws.send(json.dumps(frame))
+                    payload = await future
             except TimeoutError as exc:
                 if self._ws is ws:  # not a newer connection another request opened meanwhile
                     self._drop("daemon did not answer in time")
@@ -219,15 +245,21 @@ class DaemonSession:
         return state
 
     async def close(self) -> None:
+        """Final: a request after this raises DaemonError instead of opening a new socket."""
+        self._closed = True
         self._drop("closed", backoff=False)
         reader, self._reader = self._reader, None
         if reader is not None:
             reader.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await reader
+        if self._closers:
+            await asyncio.gather(*self._closers, return_exceptions=True)
 
     async def _ensure(self) -> Any:
         async with self._lock:
+            if self._closed:
+                raise DaemonError("daemon session is closed")
             if self._ws is not None:
                 return self._ws
             if self._clock() < self._retry_at:
@@ -235,13 +267,23 @@ class DaemonSession:
             url = daemon_url()
             self.connects += 1
             try:
-                ws = await asyncio.wait_for(self._connect(url, self._timeout), self._timeout + 1)
-                await ws.send(json.dumps(hello_message(url)))
+                async with asyncio.timeout(self._timeout + 1):
+                    ws = await self._connect(url, self._timeout)
+                    await ws.send(json.dumps(hello_message(url, modern=True)))
             except (OSError, TimeoutError, ValueError, websockets.WebSocketException) as exc:
                 self._arm_backoff()
                 raise DaemonError(f"{type(exc).__name__}: {exc}") from exc
-            self._ws = ws
+            ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._ws, self._ready = ws, ready
             self._reader = asyncio.create_task(self._read(ws))
+            try:
+                await asyncio.wait_for(ready, self._timeout)  # a session frame sent before the admission closes the socket
+            except TimeoutError as exc:
+                if self._ws is ws:
+                    self._drop("daemon did not admit the connection in time")
+                raise DaemonError("daemon did not admit the connection in time") from exc
+            finally:
+                self._ready = None
             return ws
 
     def _arm_backoff(self) -> None:
@@ -255,9 +297,11 @@ class DaemonSession:
             if backoff:
                 self._arm_backoff()
             task = asyncio.ensure_future(self._close_quietly(ws))
-            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-        for future in self._waiting.values():
-            if not future.done():
+            self._closers.add(task)
+            task.add_done_callback(self._closers.discard)
+        failed = [self._ready, *self._waiting.values()]
+        for future in failed:
+            if future is not None and not future.done():
                 future.set_exception(DaemonError(reason))
 
     @staticmethod
@@ -293,12 +337,16 @@ class DaemonSession:
         if not isinstance(message, dict):
             return False
         kind = message.get("type")
-        if kind == "hello_rejected":
+        if kind in HELLO_REJECTED:
             self._drop(f"daemon rejected the connection: {clip_reason(message.get('reason', 'unknown'))}")
             return True
         inner = message.get("message") if kind == "session" else None
         if not isinstance(inner, dict):
-            return True  # status, pong and other frames this client has no use for
+            return True  # pong and other frames this client has no use for
+        if inner.get("type") == "status":
+            if self._ready is not None and not self._ready.done():
+                self._ready.set_result(None)  # the hello was admitted (`server_info`)
+            return True
         payload = inner.get("payload")
         if inner.get("type") not in ("fetch_agent_response", "rpc_error") or not isinstance(payload, dict):
             return True
