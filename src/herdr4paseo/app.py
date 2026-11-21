@@ -69,7 +69,7 @@ from .core import (
     stop_argv,
     style_for,
 )
-from .daemon import DaemonError, fetch_commands
+from .daemon import DaemonError, DaemonSession, daemon_status_enabled, fetch_commands
 from .poll import PollConfig, PollSchedule, inspect_argv, parse_inspect
 
 MAX_LOG_LINES = 20_000  # per RichLog: older lines scroll off instead of growing memory forever
@@ -350,6 +350,7 @@ class Herdr4PaseoApp(App[None]):
         self._poll_due = 0.0
         self._stream_up_at: float | None = None  # when the current attach delivered its first line
         self._polling = False
+        self._daemon = DaemonSession() if daemon_status_enabled() else None  # one WebSocket for status polls
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -436,8 +437,22 @@ class Herdr4PaseoApp(App[None]):
         self._poll.bump()
         self._wake_poll()
 
+    async def on_unmount(self) -> None:
+        if self._daemon is not None:
+            await self._daemon.close()
+
     async def _probe_agent(self, agent_id: str) -> tuple[str, bool] | None:
-        """(status, request pending) from one `paseo agent inspect`; None sends the caller to `paseo ls`."""
+        """(status, request pending): the daemon session first, then one `paseo agent inspect`.
+
+        None sends the caller to `paseo ls`. A daemon that is down, backing off, too old or answers
+        oddly (DaemonError) only means the CLI does this poll.
+        """
+        if self._daemon is not None:
+            try:
+                state = await self._daemon.fetch_agent(agent_id)
+                return state.status, state.pending
+            except DaemonError:
+                pass
         code, out, _err = await run_paseo(inspect_argv(agent_id))
         if code != 0:
             return None
