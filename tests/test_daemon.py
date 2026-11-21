@@ -291,6 +291,7 @@ async def test_websocket_is_opened_without_a_proxy(monkeypatch):
     monkeypatch.setattr(daemon_module.websockets, "connect", fake_connect)
     await daemon_module._open("ws://127.0.0.1:6767/ws", 3.0)
     assert seen["proxy"] is None and seen["max_size"] == daemon_module.MAX_FRAME_BYTES
+    assert seen["close_timeout"] <= 2  # quitting never waits the default 10 s on a wedged daemon
 
 
 async def test_a_status_string_is_clipped(link):
@@ -336,3 +337,37 @@ def test_daemon_status_can_be_switched_off():
     assert daemon_status_enabled({})
     assert not daemon_status_enabled({"HERDR4PASEO_DAEMON_STATUS": "0"})
     assert not daemon_status_enabled({"HERDR4PASEO_DAEMON_STATUS": "off"})
+
+
+async def test_close_while_connecting_closes_the_late_socket(link):
+    gate = asyncio.Event()
+
+    async def slow_connect(url, timeout):
+        await gate.wait()
+        return await link.connect(url, timeout)
+
+    session = DaemonSession(connect=slow_connect, clock=Clock(), timeout=2.0)
+    task = asyncio.ensure_future(session.fetch_agent("agent-1"))
+    await asyncio.sleep(0.05)
+    await session.close()
+    gate.set()
+    with pytest.raises(DaemonError, match="closed"):
+        await task
+    await asyncio.sleep(0.05)
+    assert link.last.closed and not session.connected and session._reader is None
+
+
+async def test_cancelling_a_request_during_admission_does_not_leave_an_unadmitted_socket(link):
+    clock = Clock()
+    link.admit_delay = 0.3
+    session = session_for(link, clock)
+    task = asyncio.ensure_future(session.fetch_agent("agent-1"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not session.connected
+    clock.now += daemon_module.BACKOFF_FIRST + 0.1
+    assert (await session.fetch_agent("agent-1")).status == "running"
+    assert link.premature == 0
+    await session.close()

@@ -171,8 +171,9 @@ def clip_reason(value: object, limit: int = 200) -> str:
 
 
 async def _open(url: str, timeout: float) -> Any:
+    # close_timeout=1: quitting must not wait the default 10 s on a wedged or half-open daemon.
     # proxy=None: websockets would otherwise tunnel a loopback daemon through HTTPS_PROXY/ALL_PROXY, token and all
-    return await websockets.connect(url, open_timeout=timeout, max_size=MAX_FRAME_BYTES, proxy=None)
+    return await websockets.connect(url, open_timeout=timeout, max_size=MAX_FRAME_BYTES, proxy=None, close_timeout=1)
 
 
 class DaemonSession:
@@ -273,6 +274,9 @@ class DaemonSession:
             except (OSError, TimeoutError, ValueError, websockets.WebSocketException) as exc:
                 self._arm_backoff()
                 raise DaemonError(f"{type(exc).__name__}: {exc}") from exc
+            if self._closed:  # close() ran while the connect was in flight: nobody else would ever close this socket
+                await self._close_quietly(ws)
+                raise DaemonError("daemon session is closed")
             ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             self._ws, self._ready = ws, ready
             self._reader = asyncio.create_task(self._read(ws))
@@ -282,6 +286,10 @@ class DaemonSession:
                 if self._ws is ws:
                     self._drop("daemon did not admit the connection in time")
                 raise DaemonError("daemon did not admit the connection in time") from exc
+            except asyncio.CancelledError:  # an unadmitted socket must not be reused: a request on it is punished
+                if self._ws is ws:
+                    self._drop("cancelled while connecting")
+                raise
             finally:
                 self._ready = None
             return ws
