@@ -1755,3 +1755,32 @@ async def test_a_permit_refresh_finishing_while_the_app_shuts_down_is_harmless(c
         monkeypatch.setattr(app, "query_one", lambda *a, **k: (_ for _ in ()).throw(app_module.NoMatches("gone")))
         app._show_permits([])  # the banner widget is not there: no crash, the state is still recorded
         assert app.permits == []
+
+
+async def test_follow_id_change_reaches_the_daemon_session_lookup(follow, calls, monkeypatch):
+    fast_polls(monkeypatch)
+    follow.write_text(AGENT_A)
+    link = FakeLink()
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    with_daemon(app, link)
+    async with app.run_test() as pilot:
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if any(r["agentId"] == AGENT_A for r in link.requests):
+                break
+        assert any(r["agentId"] == AGENT_A for r in link.requests)
+        link.statuses[AGENT_B] = "idle"
+        write_atomically(follow, AGENT_B + "\n")  # the new lead
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if any(r["agentId"] == AGENT_B for r in link.requests):
+                break
+        assert any(r["agentId"] == AGENT_B for r in link.requests)  # the poll followed the id change
+        assert len(link.connections) == 1  # same connection, new agent
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if "idle" in app.sub_title:
+                break
+        assert "idle" in app.sub_title
