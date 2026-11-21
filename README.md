@@ -40,6 +40,7 @@ To work on it, clone the repo and run `uv tool install --editable .`.
 herdr4paseo              # pick an agent from a list
 herdr4paseo 7dba08f      # attach by id, short id or unambiguous prefix
 herdr4paseo --tail 200 --behavior interrupt 7dba08f
+herdr4paseo --follow-file ~/.local/state/djbclark-ade/supervisor/lead   # track whichever id the file holds
 ```
 
 Find an agent id with `paseo ls -g -a`. Type a prompt and press Enter to send it. Type `/` to see slash commands.
@@ -47,8 +48,15 @@ Find an agent id with `paseo ls -g -a`. Type a prompt and press Enter to send it
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `agent` | pick from a list | Agent id, short id or unambiguous id prefix |
+| `--follow-file PATH` | off | Attach to the agent id held in `PATH` (one id on one line) and switch to the new agent whenever the id in the file changes. Use it instead of `agent`; giving both is an error. See [Following an id file](#following-an-id-file). |
 | `--tail N` | 50 | Log entries to show when attaching |
 | `--behavior steer\|interrupt` | `steer` | How a send treats a turn that is still running. `interrupt` stops the turn and redirects it; `steer` steers the running turn and, per Paseo, falls back to interrupting it if steering is unavailable. |
+
+## Following an id file
+
+`--follow-file PATH` is for a tab that should always show the agent a tool names in a file, for example a lead agent whose id changes on every self-handoff. The file is read every second (a small local read, so no file-watch dependency). The first id it holds is attached; when the id changes, the same window switches to the new agent: the old agent's log process is ended, the log, slash commands and permission banner move over, and the old agent keeps running.
+
+While the file is missing, empty, unreadable or does not hold exactly one id, or names an agent `paseo ls` does not know, herdr4paseo notes it once in the log and keeps waiting; the agent already shown stays attached. Only a change of the id in the file switches agents, so Ctrl+L or Ctrl+R still work and last until the file next changes. Write the file atomically (temp file, then rename) so a reader never sees a half-written id.
 
 ## Keys
 

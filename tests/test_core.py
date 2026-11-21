@@ -21,6 +21,7 @@ from herdr4paseo.core import (
     parse_permissions,
     permit_argv,
     permit_ls_argv,
+    read_follow_id,
     run_argv,
     save_history,
     send_argv,
@@ -642,3 +643,41 @@ def test_parse_timeline_rejects_deep_nesting_and_non_objects_explicitly():
             parse_timeline("[" * 100_000 + "]" * 100_000)
         except RecursionError as exc:
             raise ValueError("recursion") from exc
+
+
+AGENT_ID = "aaaaaaa1-0000-0000-0000-000000000001"
+
+
+@pytest.mark.parametrize("text", [AGENT_ID, AGENT_ID + "\n", f"\n  {AGENT_ID}  \r\n\n", "7dba08f\n"])
+def test_read_follow_id_accepts_one_id(tmp_path, text):
+    path = tmp_path / "lead"
+    path.write_text(text)
+    ident, why = read_follow_id(str(path))
+    assert ident == text.strip() and why == ""
+
+
+@pytest.mark.parametrize(
+    ("data", "needle"),
+    [
+        (b"", "is empty"),
+        (b" \n\t\n", "is empty"),
+        (b"a b\n", "single agent id"),
+        (b"aaaaaaa\nbbbbbbb\n", "single agent id"),
+        (b"-x\n", "single agent id"),
+        (b"a/../b\n", "single agent id"),
+        (b"\xff\xfe\x00bin", "not text"),
+        (b"a" * 5000, "over 4096 bytes"),
+    ],
+)
+def test_read_follow_id_waits_on_unusable_content(tmp_path, data, needle):
+    path = tmp_path / "lead"
+    path.write_bytes(data)
+    ident, why = read_follow_id(str(path))
+    assert ident is None and needle in why
+
+
+def test_read_follow_id_missing_file_and_directory_do_not_raise(tmp_path):
+    ident, why = read_follow_id(str(tmp_path / "nope"))
+    assert ident is None and "does not exist yet" in why
+    ident, why = read_follow_id(str(tmp_path))  # reading a directory is an OSError, not a crash
+    assert ident is None and "cannot read" in why

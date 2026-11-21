@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -1015,3 +1016,162 @@ async def test_allow_dialog_fits_an_80x24_screen_with_wide_text(calls, monkeypat
         assert "[y] yes" in text and box.region.bottom <= 24 and box.region.y >= 0, (box.region, text[-80:])
         assert "evil.example" not in text
         await pilot.press("n")
+
+
+# -- --follow-file ------------------------------------------------------------------
+
+AGENT_B = "bbbbbbb2-0000-0000-0000-000000000002"
+
+
+@pytest.fixture
+def follow(calls, tmp_path, monkeypatch):
+    """A follow file path and a pid log; the file is polled every 50 ms."""
+    monkeypatch.setattr(app_module, "FOLLOW_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(app_module, "FOLLOW_RETRY_SECONDS", 0.1)
+    monkeypatch.setenv("FAKE_PASEO_PIDS", str(tmp_path / "pids.txt"))
+    return tmp_path / "lead"
+
+
+def write_atomically(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def logs_agents(calls_path: Path) -> list[str]:
+    return [c[1] for c in recorded(calls_path) if c[0] == "logs"]
+
+
+async def title_is(pilot, app, title: str) -> None:
+    for _ in range(100):
+        await pilot.pause(0.05)
+        if app.title == title:
+            return
+    raise AssertionError(f"title {title!r} never appeared; it is {app.title!r}")
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def test_follow_attaches_to_the_initial_id(follow, calls):
+    follow.write_text(AGENT_A + "\n")
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        assert app.title == "alpha (aaaaaaa)"
+    assert logs_agents(calls) == [AGENT_A]  # attached directly: no picker, no second stream
+
+
+async def test_follow_switches_when_the_id_changes_and_ends_the_old_stream(follow, calls, tmp_path):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+        await settle(pilot, app, "plain assistant line")
+        old_pid = int((tmp_path / "pids.txt").read_text().split()[1])
+        assert alive(old_pid)
+        write_atomically(follow, "bbbbbbb\n")  # the new lead; a short id works too
+        await title_is(pilot, app, "beta (bbbbbbb)")
+        await settle(pilot, app, "plain assistant line")
+        for _ in range(100):  # the replaced `paseo logs` child is terminated, not orphaned
+            if not alive(old_pid):
+                break
+            await pilot.pause(0.05)
+        assert not alive(old_pid)
+        assert "plain assistant line" in log_text(app)
+    assert logs_agents(calls) == [AGENT_A, AGENT_B]
+    assert not any(c[0] == "send" for c in recorded(calls))
+
+
+async def test_follow_reading_the_same_id_again_does_not_reattach(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        write_atomically(follow, AGENT_A + "\n\n")
+        await pilot.pause(0.4)
+    assert logs_agents(calls) == [AGENT_A]
+
+
+async def test_follow_missing_file_waits_then_attaches_when_it_appears(follow, calls):
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "does not exist yet")
+        assert app.title == "waiting for an agent id"
+        assert logs_agents(calls) == []
+        write_atomically(follow, AGENT_B)
+        await title_is(pilot, app, "beta (bbbbbbb)")
+    assert logs_agents(calls) == [AGENT_B]
+
+
+@pytest.mark.parametrize(
+    ("content", "needle"),
+    [
+        ("", "is empty"),
+        ("  \n\n", "is empty"),
+        (AGENT_A + "\n" + AGENT_B + "\n", "does not hold a single agent id"),
+        ("two words\n", "does not hold a single agent id"),
+        ("--tail\n", "does not hold a single agent id"),
+        ("not/an/id\n", "does not hold a single agent id"),
+    ],
+)
+async def test_follow_unusable_file_is_noted_once_and_not_fatal(follow, calls, content, needle):
+    follow.write_text(content)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, needle)
+        await pilot.pause(0.3)  # several polls later the notice is still one line
+        assert log_text(app).count(needle) == 1
+        assert logs_agents(calls) == []
+        write_atomically(follow, AGENT_A)
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+
+
+async def test_follow_keeps_the_agent_when_the_file_goes_empty(follow, calls):
+    follow.write_text(AGENT_A)
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "plain assistant line")
+        follow.write_text("")  # a lead is mid-handoff: the file is briefly empty
+        await settle(pilot, app, "is empty")
+        assert app.title == "alpha (aaaaaaa)"
+        write_atomically(follow, "bbbbbbb")
+        await title_is(pilot, app, "beta (bbbbbbb)")
+    assert logs_agents(calls) == [AGENT_A, AGENT_B]
+
+
+async def test_follow_unknown_id_waits_for_a_known_one(follow, calls):
+    follow.write_text("ccccccc9-not-in-paseo")
+    app = Herdr4PaseoApp(None, tail=5, behavior="steer", follow_file=str(follow))
+    async with app.run_test() as pilot:
+        await settle(pilot, app, "is not known to paseo")
+        assert logs_agents(calls) == []
+        write_atomically(follow, AGENT_A)
+        await title_is(pilot, app, "alpha (aaaaaaa)")
+
+
+def test_follow_file_and_agent_are_mutually_exclusive(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["herdr4paseo", "aaaaaaa", "--follow-file", "/x/lead"])
+    with pytest.raises(SystemExit) as exc:
+        app_module.main()
+    assert exc.value.code == 2
+    assert "not allowed with" in capsys.readouterr().err
+    with pytest.raises(ValueError):
+        Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer", follow_file="/x/lead")
+
+
+def test_main_passes_follow_file_to_the_app(monkeypatch):
+    seen = {}
+
+    def fake_run(self):
+        seen.update(agent=self._ident, follow=self._follow_file)
+
+    monkeypatch.setattr(Herdr4PaseoApp, "run", fake_run)
+    monkeypatch.setattr("sys.argv", ["herdr4paseo", "--follow-file", "/x/lead"])
+    app_module.main()
+    assert seen == {"agent": None, "follow": "/x/lead"}

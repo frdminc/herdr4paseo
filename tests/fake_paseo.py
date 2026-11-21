@@ -17,6 +17,9 @@ with open(os.environ["FAKE_PASEO_CALLS"], "a") as calls:
     calls.write(json.dumps(sys.argv[1:]) + "\n")
 
 cmd = sys.argv[1]
+if cmd == "logs" and os.environ.get("FAKE_PASEO_PIDS"):  # lets a test prove a replaced stream's process ended
+    with open(os.environ["FAKE_PASEO_PIDS"], "a") as pids:
+        pids.write(f"{sys.argv[2]} {os.getpid()}\n")
 if cmd == "ls":
     print(json.dumps(AGENTS))
 elif cmd == "logs":

@@ -8,6 +8,7 @@ herdr4paseo owns nothing. The agent, its history and its permissions live in the
 | --- | --- | --- |
 | Stop the agent (Ctrl+X, after confirmation) | `paseo stop <id>` | On request |
 | List agents, for the picker and the status line | `paseo ls -g -a --json` | On start, on Ctrl+L, every 3 s |
+| Read the follow file (`--follow-file`) | no `paseo` call: reads at most 4 KiB of `PATH`; an id that changed is looked up with `paseo ls` | Every second |
 | Stream the log | `paseo logs <id> --no-color --tail N -f` (plus `--filter tools` in tools-only view) | On attach; restarted by Ctrl+O |
 | Send a prompt | `paseo send <id> --no-wait --behavior steer\|interrupt "<text>"` | On Enter |
 | Find pending permission requests | `paseo permit ls --json` | Every 3 s; filtered to the shown agent |

@@ -61,6 +61,7 @@ from .core import (
     parse_permissions,
     permit_argv,
     permit_ls_argv,
+    read_follow_id,
     run_argv,
     save_history,
     send_argv,
@@ -72,6 +73,8 @@ from .core import (
 from .daemon import DaemonError, fetch_commands
 
 STATUS_POLL_SECONDS = 3.0
+FOLLOW_POLL_SECONDS = 1.0  # --follow-file: how often the file is read (a small local read)
+FOLLOW_RETRY_SECONDS = 3.0  # --follow-file: pause before asking `paseo ls` again about an id it could not find
 MAX_LOG_LINES = 20_000  # per RichLog: older lines scroll off instead of growing memory forever
 RENDER_BUDGET_CHARS = 512_000  # newest items rendered per chat redraw; older ones show as a count
 RENDER_SECONDS = 0.1  # at most ~10 chat re-renders a second however fast records arrive
@@ -324,9 +327,15 @@ class Herdr4PaseoApp(App[None]):
         Binding("ctrl+n", "history_next", "next", show=False),
     ]
 
-    def __init__(self, agent_ident: str | None, *, tail: int, behavior: str) -> None:
+    def __init__(self, agent_ident: str | None, *, tail: int, behavior: str, follow_file: str | None = None) -> None:
         super().__init__()
+        if agent_ident and follow_file:
+            raise ValueError("an agent id and a follow file are mutually exclusive")
         self._ident = agent_ident
+        self._follow_file = os.path.expanduser(follow_file) if follow_file else None
+        self._followed: str | None = None  # the id last attached from the follow file
+        self._follow_msg = ""  # last waiting notice, so a steady problem is noted once, not every poll
+        self._follow_retry_at = 0.0
         self._tail = tail
         self.behavior = behavior
         self.tools_only = False
@@ -362,7 +371,12 @@ class Herdr4PaseoApp(App[None]):
         prompt.slash_handler = self.handle_slash_key
         prompt.focus()
         self.set_interval(STATUS_POLL_SECONDS, self._refresh_status)
-        self._choose_agent(self._ident)
+        if self._follow_file:
+            self.title = "waiting for an agent id"
+            self.sub_title = sanitize_line(f"following {self._follow_file}")
+            self._follow_loop()
+        else:
+            self._choose_agent(self._ident)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "answer_permits":
@@ -392,6 +406,10 @@ class Herdr4PaseoApp(App[None]):
         if picked is None:
             self._note("no agent selected; Ctrl+L to pick one", "error.text")
             return
+        await self._attach(picked)
+
+    async def _attach(self, picked: Agent) -> None:
+        """Show `picked`. The log, chat and command workers are exclusive, so the old agent's `paseo logs` child is ended."""
         self.agent = picked
         self._last_status = picked.status
         self.title = sanitize_line(f"{picked.name} ({picked.short_id})")
@@ -399,6 +417,36 @@ class Herdr4PaseoApp(App[None]):
         self._start_stream()
         self._load_commands(picked.id)
         await self._refresh_permits()
+
+    # -- following an id file -------------------------------------------------------
+
+    @work(exclusive=True, group="follow")
+    async def _follow_loop(self) -> None:
+        """Attach to the id in the follow file, and again each time the file names a different one."""
+        while True:
+            await self._follow_once()
+            await asyncio.sleep(FOLLOW_POLL_SECONDS)
+
+    def _follow_wait(self, message: str) -> None:
+        if message != self._follow_msg:  # note a steady problem once, not on every poll
+            self._follow_msg = message
+            self._note(message, "meta")
+
+    async def _follow_once(self) -> None:
+        assert self._follow_file is not None
+        ident, problem = read_follow_id(self._follow_file)
+        if ident is None:
+            self._follow_wait(problem)  # keep the current agent attached while the file is unusable
+            return
+        if ident == self._followed or time.monotonic() < self._follow_retry_at:
+            return
+        agent = find_agent(await self._list_agents(), ident)
+        if agent is None:
+            self._follow_retry_at = time.monotonic() + FOLLOW_RETRY_SECONDS
+            self._follow_wait(f"agent {sanitize_line(ident)} from {self._follow_file} is not known to paseo; waiting")
+            return
+        self._followed, self._follow_msg = ident, ""
+        await self._attach(agent)
 
     async def _refresh_status(self) -> None:
         if self.agent is None:
@@ -763,7 +811,13 @@ def main() -> None:
         prog="herdr4paseo",
         description="Log view and prompt box for one Paseo agent, via the paseo CLI.",
     )
-    parser.add_argument("agent", nargs="?", help="agent id, short id or prefix; omit to pick from a list")
+    which = parser.add_mutually_exclusive_group()
+    which.add_argument("agent", nargs="?", help="agent id, short id or prefix; omit to pick from a list")
+    which.add_argument(
+        "--follow-file",
+        metavar="PATH",
+        help="attach to the agent id held in PATH and switch whenever the id in it changes (instead of an agent argument)",
+    )
     parser.add_argument("--tail", type=int, default=50, help="log entries to show on attach (default 50)")
     parser.add_argument(
         "--behavior",
@@ -772,7 +826,7 @@ def main() -> None:
         help="how sends treat a running turn (default steer; Ctrl+T toggles)",
     )
     args = parser.parse_args()
-    Herdr4PaseoApp(args.agent, tail=args.tail, behavior=args.behavior).run()
+    Herdr4PaseoApp(args.agent, tail=args.tail, behavior=args.behavior, follow_file=args.follow_file).run()
 
 
 if __name__ == "__main__":
