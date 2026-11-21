@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,23 +167,34 @@ def find_agent(agents: list[Agent], ident: str) -> Agent | None:
     return prefixed[0] if len(prefixed) == 1 else None
 
 
-FOLLOW_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")  # a leading `-` could pass as a CLI flag
+# The follow file must hold a full agent UUID: a short id or prefix could match another agent
+# (find_agent falls back to a unique prefix) if a writer is caught half way through.
+FOLLOW_ID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 FOLLOW_FILE_MAX_BYTES = 4096
 
 
 def read_follow_id(path: str) -> tuple[str | None, str]:
-    """Read the one agent id held in `path`: (id, "") or (None, why it cannot be used yet).
+    """Read the one full agent id (lower-cased) held in `path`: (id, "") or (None, why it cannot be used yet).
 
-    Never raises: a missing, unreadable, empty or garbled file is a state to wait out,
-    not a reason to close the tab. Surrounding whitespace and blank lines are ignored.
+    Never raises or blocks: a missing, unreadable, special (FIFO, directory, device), empty or garbled
+    file is a state to wait out, not a reason to close the tab. Surrounding whitespace and blank lines
+    are ignored.
     """
     try:
-        with open(path, "rb") as handle:
-            raw = handle.read(FOLLOW_FILE_MAX_BYTES + 1)
+        # O_NONBLOCK: opening a FIFO must not wait for a writer (it would freeze the event loop)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
         return None, f"follow file {path} does not exist yet; waiting for it"
     except OSError as exc:
         return None, f"cannot read follow file {path}: {exc.strerror or exc}; waiting"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, f"follow file {path} is not a regular file; waiting"
+        raw = os.read(fd, FOLLOW_FILE_MAX_BYTES + 1)
+    except OSError as exc:
+        return None, f"cannot read follow file {path}: {exc.strerror or exc}; waiting"
+    finally:
+        os.close(fd)
     if len(raw) > FOLLOW_FILE_MAX_BYTES:
         return None, f"follow file {path} is over {FOLLOW_FILE_MAX_BYTES} bytes, not an agent id; waiting"
     try:
@@ -192,8 +204,13 @@ def read_follow_id(path: str) -> tuple[str | None, str]:
     if not lines:
         return None, f"follow file {path} is empty; waiting for an agent id"
     if len(lines) > 1 or not FOLLOW_ID_RE.fullmatch(lines[0]):
-        return None, f"follow file {path} does not hold a single agent id; waiting"
-    return lines[0], ""
+        return None, f"follow file {path} does not hold a single agent id (a full UUID); waiting"
+    return lines[0].lower(), ""
+
+
+def find_followed_agent(agents: list[Agent], ident: str) -> Agent | None:
+    """The agent whose full id is `ident`. Unlike find_agent there is no short-id or prefix match."""
+    return next((a for a in agents if a.id.lower() == ident), None)
 
 
 def filter_agents(agents: list[Agent], query: str) -> list[Agent]:

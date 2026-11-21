@@ -48,15 +48,18 @@ Find an agent id with `paseo ls -g -a`. Type a prompt and press Enter to send it
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `agent` | pick from a list | Agent id, short id or unambiguous id prefix |
-| `--follow-file PATH` | off | Attach to the agent id held in `PATH` (one id on one line) and switch to the new agent whenever the id in the file changes. Use it instead of `agent`; giving both is an error. See [Following an id file](#following-an-id-file). |
+| `--follow-file PATH` | off | Attach to the agent id held in `PATH` (one full agent UUID on one line) and switch to the new agent whenever the id in the file changes. Use it instead of `agent`; giving both is an error. See [Following an id file](#following-an-id-file). |
 | `--tail N` | 50 | Log entries to show when attaching |
 | `--behavior steer\|interrupt` | `steer` | How a send treats a turn that is still running. `interrupt` stops the turn and redirects it; `steer` steers the running turn and, per Paseo, falls back to interrupting it if steering is unavailable. |
 
 ## Following an id file
 
-`--follow-file PATH` is for a tab that should always show the agent a tool names in a file, for example a lead agent whose id changes on every self-handoff. The file is read every second (a small local read, so no file-watch dependency). The first id it holds is attached; when the id changes, the same window switches to the new agent: the old agent's log process is ended, the log, slash commands and permission banner move over, and the old agent keeps running.
+`--follow-file PATH` is for a tab that should always show the agent a tool names in a file, for example a lead agent whose id changes on every self-handoff. The file must hold one **full agent UUID** (short ids and prefixes are refused, because a half-written prefix could match a different agent). It is read every second (a small local read, so no file-watch dependency). The first id it holds is attached; when the id changes, the same window switches to the new agent: the old agent's log process is ended, the log, slash commands and permission banner move over, a `follow: switched from ... to ...` line starts the log, the header ends in `| follow`, and the old agent keeps running.
 
-While the file is missing, empty, unreadable or does not hold exactly one id, or names an agent `paseo ls` does not know, herdr4paseo notes it once in the log and keeps waiting; the agent already shown stays attached. Only a change of the id in the file switches agents, so Ctrl+L or Ctrl+R still work and last until the file next changes. Write the file atomically (temp file, then rename) so a reader never sees a half-written id.
+1. While the file is missing, empty, unreadable, not a regular file (a FIFO or directory is never opened for reading), over 4 KiB or does not hold exactly one UUID, or names an agent `paseo ls` does not know, herdr4paseo notes it once and keeps waiting; the agent already shown stays attached.
+2. A confirmation dialog (Ctrl+X stop, Ctrl+A or Ctrl+D permissions) names its agent when it opens, and answers only that agent even if the file switches the tab while the dialog is open.
+3. If the followed agent is archived (`paseo ls -a` lists archived agents too), the log says so and prompts are not sent to it, because Paseo un-archives an agent that receives a message. They resume when the file names another agent. Without `--follow-file` nothing changes: a prompt to an archived agent is still sent.
+4. Only a change of the id in the file switches agents, so Ctrl+L or Ctrl+R still work and last until the file next changes. Write the file atomically (temp file, then rename) so a reader never sees a half-written id. Rewriting the same agent's id in another case does nothing.
 
 ## Keys
 

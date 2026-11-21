@@ -38,6 +38,7 @@ from .core import (
     agent_label_text,
     filter_agents,
     find_agent,
+    find_followed_agent,
     history_path,
     load_history,
     logs_argv,
@@ -334,8 +335,11 @@ class Herdr4PaseoApp(App[None]):
         self._ident = agent_ident
         self._follow_file = os.path.expanduser(follow_file) if follow_file else None
         self._followed: str | None = None  # the id last attached from the follow file
-        self._follow_msg = ""  # last waiting notice, so a steady problem is noted once, not every poll
+        self._follow_problem = ""  # last file problem noted, so a steady one is noted once, not every poll
+        self._follow_unknown: str | None = None  # id last noted as unknown to paseo
         self._follow_retry_at = 0.0
+        self._archived_noted: str | None = None  # id of the followed agent already noted as archived
+        self._stream_banner = ""  # written first in the log after each (re)attach; the stream clears the log
         self._tail = tail
         self.behavior = behavior
         self.tools_only = False
@@ -410,15 +414,32 @@ class Herdr4PaseoApp(App[None]):
 
     async def _attach(self, picked: Agent) -> None:
         """Show `picked`. The log, chat and command workers are exclusive, so the old agent's `paseo logs` child is ended."""
-        self.agent = picked
+        previous, self.agent = self.agent, picked
         self._last_status = picked.status
         self.title = sanitize_line(f"{picked.name} ({picked.short_id})")
         self._update_subtitle(picked.status)
+        self._stream_banner = self._attach_banner(previous, picked)
         self._start_stream()
         self._load_commands(picked.id)
         await self._refresh_permits()
 
     # -- following an id file -------------------------------------------------------
+
+    def _attach_banner(self, previous: Agent | None, picked: Agent) -> str:
+        """Follow mode only: say why the log changed, and flag an archived agent plainly."""
+        if not self._follow_file:
+            return ""
+        lines = []
+        if previous is not None and previous.id != picked.id:
+            lines.append(f"follow: switched from {previous.name} ({previous.short_id}) to {picked.name} ({picked.short_id})")
+        if picked.status == "archived":
+            lines.append(self._archived_text(picked))
+            self._archived_noted = picked.id
+        return "\n".join(lines)
+
+    def _archived_text(self, agent: Agent) -> str:
+        return (f"followed agent {agent.name} ({agent.short_id}) is archived and {self._follow_file} names no other agent; "
+                "prompts are not sent to it until the file changes")
 
     @work(exclusive=True, group="follow")
     async def _follow_loop(self) -> None:
@@ -427,35 +448,47 @@ class Herdr4PaseoApp(App[None]):
             await self._follow_once()
             await asyncio.sleep(FOLLOW_POLL_SECONDS)
 
-    def _follow_wait(self, message: str) -> None:
-        if message != self._follow_msg:  # note a steady problem once, not on every poll
-            self._follow_msg = message
-            self._note(message, "meta")
-
     async def _follow_once(self) -> None:
         assert self._follow_file is not None
         ident, problem = read_follow_id(self._follow_file)
         if ident is None:
-            self._follow_wait(problem)  # keep the current agent attached while the file is unusable
+            self._follow_unknown = None
+            if problem != self._follow_problem:  # keep the current agent attached while the file is unusable
+                self._follow_problem = problem
+                self._note(problem, "meta")
             return
+        self._follow_problem = ""
         if ident == self._followed or time.monotonic() < self._follow_retry_at:
             return
-        agent = find_agent(await self._list_agents(), ident)
+        agent = find_followed_agent(await self._list_agents(), ident)
         if agent is None:
             self._follow_retry_at = time.monotonic() + FOLLOW_RETRY_SECONDS
-            self._follow_wait(f"agent {sanitize_line(ident)} from {self._follow_file} is not known to paseo; waiting")
+            if self._follow_unknown != ident:
+                self._follow_unknown = ident
+                self._note(f"agent {ident} from {self._follow_file} is not known to paseo; waiting", "meta")
             return
-        self._followed, self._follow_msg = ident, ""
+        self._followed, self._follow_unknown = ident, None
         await self._attach(agent)
 
     async def _refresh_status(self) -> None:
-        if self.agent is None:
+        agent = self.agent
+        if agent is None:
             return
         before = len(self.permits)
-        current = find_agent(await self._list_agents(), self.agent.id)
+        current = find_agent(await self._list_agents(), agent.id)
+        if self.agent is not agent:  # the shown agent changed during the call: this answer is stale
+            return
         if current is not None:
             self._update_subtitle(current.status)
+            if self._follow_file:
+                if current.status != "archived":
+                    self._archived_noted = None
+                elif self._archived_noted != current.id:
+                    self._archived_noted = current.id
+                    self._note(self._archived_text(current), "error.text")
         await self._refresh_permits()
+        if self.agent is not agent:
+            return
         if current is not None:
             reason = should_alert(self._last_status, current.status, before, len(self.permits))
             self._last_status = current.status
@@ -465,17 +498,21 @@ class Herdr4PaseoApp(App[None]):
 
     async def _refresh_permits(self) -> None:
         """Poll pending permission requests for the shown agent and update the banner."""
-        if self.agent is None:
+        agent = self.agent
+        if agent is None:
             return
         code, out, _err = await run_paseo(permit_ls_argv())
-        if code != 0:
+        if code != 0 or self.agent is not agent:
             return  # keep the last banner; a transient failure must not hide a pending request
         try:
-            self.permits = parse_permissions(out, self.agent.id)
+            self.permits = parse_permissions(out, agent.id)
         except (ValueError, TypeError, AttributeError):
             return
         self.refresh_bindings()
-        banner = self.query_one("#permits", Static)
+        try:
+            banner = self.query_one("#permits", Static)
+        except NoMatches:  # the app is shutting down (a quit while an attach was polling)
+            return
         if self.permits:
             names = "; ".join(clip_label(p.label, 80) for p in self.permits[:3])
             if len(self.permits) > 3:
@@ -501,7 +538,8 @@ class Herdr4PaseoApp(App[None]):
     def _update_subtitle(self, status: str) -> None:
         view = "tools only" if self.tools_only else "full log"
         status = sanitize_line(status)
-        self.sub_title = f"{status} | send: {self.behavior} | {'chat' if self.chat_view else 'log'} | {view}"
+        follow = " | follow" if self._follow_file else ""
+        self.sub_title = f"{status} | send: {self.behavior} | {'chat' if self.chat_view else 'log'} | {view}{follow}"
 
     # -- log stream -----------------------------------------------------------------
 
@@ -522,6 +560,8 @@ class Herdr4PaseoApp(App[None]):
         self.workers.cancel_group(self, "chat-stream")
         while True:
             log.clear()
+            if self._stream_banner:
+                self._note(self._stream_banner, "meta")
             styler = LogStyler()  # fresh state for each (re)attach: the tail is replayed from scratch
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -713,6 +753,9 @@ class Herdr4PaseoApp(App[None]):
         if text.lower() in QUIT_COMMANDS:  # handled here, never sent to the agent
             self.exit()
             return
+        if self._follow_file and self._last_status == "archived":  # a message would un-archive it
+            self._note(f"not sent: {sanitize_line(self.agent.name)} is archived and the follow file names no other agent", "error.text")
+            return
         code, _out, err = await run_paseo(send_argv(self.agent.id, text, self.behavior))
         if code != 0:
             self._note(f"send failed (rc={code}): {err.strip()}", "error.text")
@@ -745,9 +788,12 @@ class Herdr4PaseoApp(App[None]):
 
     @work(exclusive=True, group="permit")  # push_screen_wait only runs inside a worker
     async def action_answer_permits(self, decision: str) -> None:
-        if self.agent is None:
+        agent = self.agent  # the agent whose requests the dialog lists; a switch must not retarget the answer
+        if agent is None:
             return
         await self._refresh_permits()
+        if self.agent is not agent:
+            return
         pending = list(self.permits)
         shown = permit_batch(pending, decision)  # answer exactly what the confirmation lists in full
         if not pending:
@@ -759,7 +805,7 @@ class Herdr4PaseoApp(App[None]):
         if not await self.push_screen_wait(ConfirmPermits(decision, shown, len(pending), self.permit_clock)):
             return
         for permit in shown:
-            code, _out, err = await run_paseo(permit_argv(decision, self.agent.id, permit.id))
+            code, _out, err = await run_paseo(permit_argv(decision, agent.id, permit.id))
             result = "ok" if code == 0 else f"failed (rc={code}): {err.strip()}"
             self._note(f"permit {decision} {permit.label}: {result}", "success" if code == 0 else "error.text")
         await self._refresh_permits()
@@ -782,13 +828,14 @@ class Herdr4PaseoApp(App[None]):
 
     @work(exclusive=True, group="stop")  # push_screen_wait only runs inside a worker
     async def action_stop_agent(self) -> None:
-        if self.agent is None:
+        target = self.agent  # the agent the dialog names: a follow-file switch must not retarget the answer
+        if target is None:
             return
-        if not await self.push_screen_wait(ConfirmStop(self.agent)):
+        if not await self.push_screen_wait(ConfirmStop(target)):
             return
-        code, _out, err = await run_paseo(stop_argv(self.agent.id))
+        code, _out, err = await run_paseo(stop_argv(target.id))
         if code == 0:
-            self._note(f"stopped {self.agent.name}", "status")
+            self._note(f"stopped {target.name}", "status")
         else:
             self._note(f"stop failed (rc={code}): {err.strip()}", "error.text")
 

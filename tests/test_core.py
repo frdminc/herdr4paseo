@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 from rich.color import ColorSystem
@@ -14,6 +15,7 @@ from herdr4paseo.core import (
     agent_label_text,
     filter_agents,
     find_agent,
+    find_followed_agent,
     load_history,
     logs_argv,
     ls_argv,
@@ -648,7 +650,7 @@ def test_parse_timeline_rejects_deep_nesting_and_non_objects_explicitly():
 AGENT_ID = "aaaaaaa1-0000-0000-0000-000000000001"
 
 
-@pytest.mark.parametrize("text", [AGENT_ID, AGENT_ID + "\n", f"\n  {AGENT_ID}  \r\n\n", "7dba08f\n"])
+@pytest.mark.parametrize("text", [AGENT_ID, AGENT_ID + "\n", f"\n  {AGENT_ID}  \r\n\n"])
 def test_read_follow_id_accepts_one_id(tmp_path, text):
     path = tmp_path / "lead"
     path.write_text(text)
@@ -662,6 +664,8 @@ def test_read_follow_id_accepts_one_id(tmp_path, text):
         (b"", "is empty"),
         (b" \n\t\n", "is empty"),
         (b"a b\n", "single agent id"),
+        (b"7dba08f\n", "single agent id"),  # short ids and prefixes are refused
+        (AGENT_ID.encode()[:30] + b"\n", "single agent id"),
         (b"aaaaaaa\nbbbbbbb\n", "single agent id"),
         (b"-x\n", "single agent id"),
         (b"a/../b\n", "single agent id"),
@@ -679,5 +683,21 @@ def test_read_follow_id_waits_on_unusable_content(tmp_path, data, needle):
 def test_read_follow_id_missing_file_and_directory_do_not_raise(tmp_path):
     ident, why = read_follow_id(str(tmp_path / "nope"))
     assert ident is None and "does not exist yet" in why
-    ident, why = read_follow_id(str(tmp_path))  # reading a directory is an OSError, not a crash
-    assert ident is None and "cannot read" in why
+    ident, why = read_follow_id(str(tmp_path))  # a directory is not a regular file
+    assert ident is None and "not a regular file" in why
+
+
+def test_read_follow_id_fifo_returns_at_once(tmp_path):
+    fifo = tmp_path / "lead"
+    os.mkfifo(fifo)  # no writer: a blocking open() would hang here
+    ident, why = read_follow_id(str(fifo))
+    assert ident is None and "not a regular file" in why
+
+
+def test_read_follow_id_lowercases_and_find_followed_agent_is_exact():
+    upper = AGENT_ID.upper()
+    agents = [Agent(AGENT_ID, "aaaaaaa", "a", "p", "idle", ""), Agent("bbbbbbb2-0000-0000-0000-000000000002", "bbbbbbb", "b", "p", "idle", "")]
+    assert find_followed_agent(agents, AGENT_ID).short_id == "aaaaaaa"
+    assert find_followed_agent(agents, "aaaaaaa") is None  # no short id
+    assert find_followed_agent(agents, AGENT_ID[:12]) is None  # no prefix
+    assert find_followed_agent(agents, upper.lower()).short_id == "aaaaaaa"
