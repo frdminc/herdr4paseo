@@ -89,6 +89,7 @@ elif cmd == "logs":
         sys.stdout.flush()
         time.sleep(30)
         sys.exit(0)
+    time.sleep(float(os.environ.get("FAKE_PASEO_LOG_DELAY", "0")))  # a slow `paseo logs` start
     print("[Shell] ls" if tools_only else "[User] hello there")
     if not tools_only:
         print("plain assistant line")

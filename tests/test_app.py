@@ -27,6 +27,10 @@ def calls(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR4PASEO_HISTORY", str(tmp_path / "history.json"))
     monkeypatch.delenv("FAKE_PASEO_SEND_FAIL", raising=False)
     monkeypatch.delenv("FAKE_PASEO_LOGS_EXIT", raising=False)
+    monkeypatch.delenv("FAKE_PASEO_LOG_LATE", raising=False)
+    monkeypatch.delenv("FAKE_PASEO_LOG_DELAY", raising=False)
+    monkeypatch.delenv("FAKE_PASEO_INSPECT_FAIL", raising=False)
+    monkeypatch.delenv("FAKE_PASEO_INSPECT_SLEEP_A", raising=False)
     monkeypatch.delenv("FAKE_PASEO_RUN_FAIL", raising=False)
     monkeypatch.delenv("FAKE_PASEO_STATUS", raising=False)
     return path
@@ -1154,3 +1158,19 @@ async def test_a_stream_that_keeps_ending_does_not_keep_the_poll_fast(calls, mon
     rec = recorded(calls)
     assert sum(c[0] == "logs" for c in rec) >= 5  # the stream really did reattach again and again
     assert sum(c[:2] == ["agent", "inspect"] for c in rec) <= 3  # replayed lines are not wake-ups
+
+
+async def test_a_slow_logs_start_does_not_turn_its_replay_into_a_wake_up(calls, monkeypatch):
+    fast_polls(monkeypatch, IDLE="30", IDLE_MAX="30", ACTIVE="30", FAST="0.5", BURST="0.5")
+    monkeypatch.setattr("herdr4paseo.app.RECONNECT_SECONDS", 0.1)
+    monkeypatch.setenv("FAKE_PASEO_STATUS", "idle")
+    monkeypatch.setenv("FAKE_PASEO_LOGS_EXIT", "1")
+    monkeypatch.setenv("FAKE_PASEO_LOG_DELAY", "1.2")  # the tail arrives long after spawn, then the stream ends
+    app = Herdr4PaseoApp("aaaaaaa", tail=5, behavior="steer")
+    async with app.run_test() as pilot:
+        await pilot.pause(4.5)
+        app.workers.cancel_group(app, "stream")
+        await pilot.pause(0.3)
+    rec = recorded(calls)
+    assert sum(c[0] == "logs" for c in rec) >= 3
+    assert sum(c[:2] == ["agent", "inspect"] for c in rec) <= 2
