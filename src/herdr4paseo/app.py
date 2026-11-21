@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import os
+import time
 from collections.abc import Callable
 
 from textual import events, work
@@ -75,6 +76,9 @@ MAX_LOG_LINES = 20_000  # per RichLog: older lines scroll off instead of growing
 RENDER_BUDGET_CHARS = 512_000  # newest items rendered per chat redraw; older ones show as a count
 RENDER_SECONDS = 0.1  # at most ~10 chat re-renders a second however fast records arrive
 RECONNECT_SECONDS = 3.0
+# `y` in an ALLOW dialog is ignored (bell) for this long after the dialog mounts, so a fast
+# repeated Ctrl+A, y cannot approve a request that was on screen for only a split second.
+ALLOW_DELAY_SECONDS = 0.5
 
 
 class PromptArea(TextArea):
@@ -204,9 +208,17 @@ class ConfirmPermits(ModalScreen[bool]):
         Binding("n,escape", "confirm(False)", "No"),
     ]
 
-    def __init__(self, decision: str, permits: list[Permission], pending: int | None = None) -> None:
+    def __init__(
+        self,
+        decision: str,
+        permits: list[Permission],
+        pending: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         super().__init__()
         self._decision = decision
+        self._clock = clock
+        self._mounted_at: float | None = None
         self._permits = permits
         self._pending = len(permits) if pending is None else pending
 
@@ -225,7 +237,15 @@ class ConfirmPermits(ModalScreen[bool]):
             markup=False,
         )
 
+    def on_mount(self) -> None:
+        self._mounted_at = self._clock()
+
     def action_confirm(self, answer: bool) -> None:
+        # Deny stays instant (denying an unread request is safe); allow waits out the delay.
+        if answer and self._decision == "allow":
+            if self._mounted_at is None or self._clock() - self._mounted_at < ALLOW_DELAY_SECONDS:
+                self.app.bell()
+                return
         self.dismiss(answer)
 
 
@@ -320,6 +340,7 @@ class Herdr4PaseoApp(App[None]):
         self._last_status: str | None = None
         self._history_pos = len(self._history)
         self.permits: list[Permission] = []
+        self.permit_clock: Callable[[], float] = time.monotonic  # tests inject a fake clock
         self.commands: list[Command] = []
         self.slash_matches: list[Command] = []
         self._slash_idx = 0
@@ -687,7 +708,7 @@ class Herdr4PaseoApp(App[None]):
         if not shown:
             self._note("pending request(s) too long to review here; answer them with `paseo permit allow` after reading them", "error.text")
             return
-        if not await self.push_screen_wait(ConfirmPermits(decision, shown, len(pending))):
+        if not await self.push_screen_wait(ConfirmPermits(decision, shown, len(pending), self.permit_clock)):
             return
         for permit in shown:
             code, _out, err = await run_paseo(permit_argv(decision, self.agent.id, permit.id))
